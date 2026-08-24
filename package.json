@@ -3,8 +3,7 @@
   "displayName": "Lunit Test Explorer",
   "description": "Discover and run @rbxts/lunit tests from VS Code's Test Explorer.",
   "version": "0.1.0",
-  "private": true,
-  "publisher": "local",
+  "publisher": "ShaderCloud",
   "author": "ShaderCloud",
   "repository": {
     "type": "git",
