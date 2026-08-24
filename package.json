@@ -1,0 +1,205 @@
+{
+  "name": "vscode-lunit",
+  "displayName": "Lunit Test Explorer",
+  "description": "Discover and run @rbxts/lunit tests from VS Code's Test Explorer.",
+  "version": "0.1.0",
+  "private": true,
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Testing"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "lunit.refreshTests",
+        "title": "Lunit: Refresh Tests",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "lunit.runAllTests",
+        "title": "Lunit: Run All Tests",
+        "icon": "$(play)"
+      },
+      {
+        "command": "lunit.showOutput",
+        "title": "Lunit: Show Test Output"
+      },
+      {
+        "command": "lunit.openStudioBootstrapScript",
+        "title": "Lunit: Show Generated Roblox Studio Bootstrap Script"
+      },
+      {
+        "command": "lunit.installStudioPlugin",
+        "title": "Lunit: Install Roblox Studio Live-Sync Plugin"
+      },
+      {
+        "command": "lunit.showLiveSyncStatus",
+        "title": "Lunit: Show Roblox Studio Live-Sync Status"
+      },
+      {
+        "command": "lunit.installAgentInstructions",
+        "title": "Lunit: Add/Update Agent Instructions (AGENTS.md)"
+      }
+    ],
+    "configuration": {
+      "title": "Lunit",
+      "properties": {
+        "lunit.testGlob": {
+          "type": "string",
+          "default": "**/*.{test,spec}.{ts,tsx}",
+          "description": "Glob pattern (relative to the workspace folder) used to discover Lunit test source files."
+        },
+        "lunit.excludeGlob": {
+          "type": "string",
+          "default": "**/node_modules/**",
+          "description": "Glob pattern of files/folders to exclude from test discovery."
+        },
+        "lunit.skipCompile": {
+          "type": "boolean",
+          "default": false,
+          "description": "Skip running the compile command before executing tests (use if you compile separately, e.g. with a watch task)."
+        },
+        "lunit.compileCommand": {
+          "type": "string",
+          "default": "npx rbxtsc",
+          "description": "Command used to compile the roblox-ts project to Luau before running tests. Run from the workspace folder root."
+        },
+        "lunit.outDir": {
+          "type": "string",
+          "default": "out",
+          "description": "Output directory that rbxtsc compiles Luau into. Used to build ${outDir} in other settings."
+        },
+        "lunit.env": {
+          "type": "object",
+          "default": {},
+          "description": "Additional environment variables to set when running the compile/test commands."
+        },
+        "lunit.lune.executable": {
+          "type": "string",
+          "default": "lune",
+          "description": "Command used to invoke Lune (e.g. \"lune\", \"npx lune\", or an absolute path), used to run the generated test runner script."
+        },
+        "lunit.testsRoot": {
+          "type": "string",
+          "default": "${workspaceFolder}",
+          "description": "Directory the Lune profile walks recursively for compiled *.test.luau / *.spec.luau files (skipping node_modules). Defaults to the whole workspace folder rather than just ${outDir}, so nested packages with their own tsconfig.json/outDir (e.g. a package embedded in a larger dev workspace, compiled independently of the top-level project) are still found -- no project-specific test folder layout needs configuring. A test file that fails to load under Lune (e.g. a Studio-only test importing something Lune can't run) is skipped with a warning, not a hard failure. Narrow this only if you want the Lune profile to ignore a whole subtree entirely."
+        },
+        "lunit.lunitRoot": {
+          "type": "string",
+          "default": "${workspaceFolder}/node_modules/@rbxts/lunit/out",
+          "description": "Directory containing the compiled @rbxts/lunit framework, passed to Lune's rbxRequire. Published @rbxts packages normally ship pre-built Luau directly in node_modules rather than being recompiled by rbxtsc, so this is usually node_modules/@rbxts/lunit/out -- override if your project vendors or rebuilds Lunit elsewhere."
+        },
+        "lunit.studio.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Register a second 'Run in Roblox Studio' test profile (selectable from the Test Explorer run dropdown) alongside the Lune profile."
+        },
+        "lunit.studio.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to RobloxStudioBeta.exe. Leave blank to auto-detect the latest installed version under %LOCALAPPDATA%\\Roblox\\Versions (Windows)."
+        },
+        "lunit.studio.buildPlaceCommand": {
+          "type": "string",
+          "default": "npx rojo build \"${projectFile}\" --output \"${placeFile}\"",
+          "description": "Command that builds the standalone .rbxl place file Studio's CLI opens. Defaults to the extension's own self-contained, auto-generated test project (no default.project.json required) -- override only if you need tests to run against your project's real place instead."
+        },
+        "lunit.studio.projectFile": {
+          "type": "string",
+          "default": "${storageDir}/studio-test.project.json",
+          "description": "Path to the auto-generated, self-contained Rojo project file used to build the test place. Fully auto-generated and regenerated before every run -- not meant to be hand-edited. Lives in this extension's per-workspace storage, outside your project, by default."
+        },
+        "lunit.studio.placeFile": {
+          "type": "string",
+          "default": "${storageDir}/test-place.rbxl",
+          "description": "Path to the local place file built by lunit.studio.buildPlaceCommand and opened by Roblox Studio's --localPlaceFile flag. Lives in this extension's per-workspace storage, outside your project, by default."
+        },
+        "lunit.studio.bootstrapScript": {
+          "type": "string",
+          "default": "${storageDir}/studio-bootstrap.luau",
+          "description": "Luau script passed to Roblox Studio's --runScriptFile flag. Fully auto-generated and regenerated before every run -- not meant to be hand-edited. Lives in this extension's per-workspace storage, outside your project, by default."
+        },
+        "lunit.studio.outputFile": {
+          "type": "string",
+          "default": "${storageDir}/studio-output.log",
+          "description": "File Roblox Studio writes script output to (--outputFile), which is parsed for pass/fail results. Lives in this extension's per-workspace storage, outside your project, by default."
+        },
+        "lunit.studio.quitAfterExecution": {
+          "type": "boolean",
+          "default": true,
+          "description": "Pass --quitAfterExecution so Studio closes automatically once the bootstrap script finishes."
+        },
+        "lunit.studio.timeoutSeconds": {
+          "type": "number",
+          "default": 180,
+          "description": "Kill the Studio process if it has not exited after this many seconds (safeguard in case Studio does not quit on its own)."
+        },
+        "lunit.studio.liveSync.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a Roblox Studio instance is already open with this project live-synced via Rojo, and the companion Lunit Studio plugin (see 'Lunit: Install Roblox Studio Live-Sync Plugin') is installed and polling, run tests there directly instead of building a place and launching a new Studio process -- faster, and doesn't require Play mode. Falls back to the normal build+launch path automatically when no plugin is connected."
+        },
+        "lunit.studio.liveSync.port": {
+          "type": "number",
+          "default": 34873,
+          "description": "Port the extension's local (127.0.0.1-only) live-sync server listens on, and the companion Studio plugin polls. Change this if the port is already in use -- you'll also need to reinstall the plugin afterward so it picks up the new port."
+        },
+        "lunit.studio.liveSync.timeoutSeconds": {
+          "type": "number",
+          "default": 30,
+          "description": "How long to wait for the connected Studio plugin to run the tests and report back before giving up."
+        },
+        "lunit.studio.liveSync.syncDelaySeconds": {
+          "type": "number",
+          "default": 1,
+          "description": "After compiling, how long to wait before running tests in the live-synced Studio instance, to give your running `rojo serve` a moment to push the freshly compiled changes in. Increase if results seem to lag one run behind your latest edits."
+        }
+      }
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "lunit.refreshTests"
+        },
+        {
+          "command": "lunit.runAllTests"
+        },
+        {
+          "command": "lunit.showOutput"
+        },
+        {
+          "command": "lunit.openStudioBootstrapScript"
+        },
+        {
+          "command": "lunit.installStudioPlugin"
+        },
+        {
+          "command": "lunit.showLiveSyncStatus"
+        },
+        {
+          "command": "lunit.installAgentInstructions"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "typescript": "^5.4.5"
+  }
+}
