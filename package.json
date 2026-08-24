@@ -5,6 +5,15 @@
   "version": "0.1.0",
   "private": true,
   "publisher": "local",
+  "author": "ShaderCloud",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Shadercloud/lunit-vscode-companion.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Shadercloud/lunit-vscode-companion/issues"
+  },
+  "homepage": "https://github.com/Shadercloud/lunit-vscode-companion#readme",
   "engines": {
     "vscode": "^1.85.0"
   },
