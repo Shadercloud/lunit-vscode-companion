@@ -5,6 +5,8 @@
   "version": "0.1.0",
   "publisher": "ShaderCloud",
   "author": "ShaderCloud",
+  "license": "MIT",
+  "icon": "images/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/Shadercloud/lunit-vscode-companion.git"
