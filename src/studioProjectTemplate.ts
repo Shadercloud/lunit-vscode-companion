@@ -9,6 +9,9 @@
  *   ReplicatedStorage.rbxts_include                              <- node_modules/roblox-ts/include
  *   ReplicatedStorage.rbxts_include.node_modules[scope]           <- node_modules/<scope>, for every "@..." scope folder with Luau content
  *   ReplicatedStorage.rbxts_include.node_modules[packageScope][name] <- ${outDir} (the package/game under test, under its own scope)
+ *   ReplicatedStorage.rbxts_include.node_modules[scope][name]     <- one more per nested package under test found elsewhere in the
+ *                                                                    workspace (see findNestedTestPackages) -- same idea, for a package
+ *                                                                    embedded in a larger dev workspace with its own tsconfig.json/outDir
  *
  * Each qualifying scope is synced wholesale with one `$path`, deliberately
  * *not* flattened package-by-package. Rojo auto-loads any nested
@@ -65,6 +68,15 @@ export interface StudioProjectPaths {
 	packageScope: string;
 	/** The package's own name with its scope stripped, e.g. "react-clean-ui". Used as its mount name under node_modules[packageScope]. */
 	packageName: string;
+	/**
+	 * Other, independently-compiled packages under test found elsewhere in
+	 * the workspace (see studioRunner.ts's findNestedTestPackages) -- e.g. a
+	 * package embedded in a larger dev workspace, with its own
+	 * tsconfig.json/outDir separate from the top-level one above. Mounted the
+	 * same way: under node_modules[scope][name], merged into an existing
+	 * scope folder if `scopePaths` already has a real one.
+	 */
+	extraPackages?: ReadonlyArray<{ scope: string; name: string; outDirPath: string }>;
 }
 
 export function buildStudioProjectFile(paths: StudioProjectPaths): string {
@@ -80,6 +92,15 @@ export function buildStudioProjectFile(paths: StudioProjectPaths): string {
 	// folder (a project never depends on its own scope's sibling packages).
 	if (!paths.scopePaths.has(paths.packageScope)) {
 		nodeModules[paths.packageScope] = { $className: 'Folder', [paths.packageName]: { $path: paths.outDirPath } };
+	}
+
+	for (const extra of paths.extraPackages ?? []) {
+		const existingScope = nodeModules[extra.scope] as Record<string, unknown> | undefined;
+		if (existingScope) {
+			existingScope[extra.name] = { $path: extra.outDirPath };
+		} else {
+			nodeModules[extra.scope] = { $className: 'Folder', [extra.name]: { $path: extra.outDirPath } };
+		}
 	}
 
 	const project = {

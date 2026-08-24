@@ -188,6 +188,67 @@ interface PackageJson {
 	name?: string;
 }
 
+interface NestedTestPackage {
+	scope: string;
+	name: string;
+	outDirPath: string;
+}
+
+/**
+ * Finds every OTHER directory in the workspace, besides the top-level
+ * `config.outDir` itself, literally named the same as it (default "out")
+ * and actually containing compiled Luau -- i.e. every nested roblox-ts
+ * package with its own independent tsconfig.json/outDir, embedded somewhere
+ * in a larger dev workspace (the standalone-Studio-build counterpart to the
+ * `lunit.testsRoot` fix for the Lune profile in config.ts -- same root
+ * cause: a package's tests aren't necessarily under the workspace root's own
+ * compiled output). Confirmed against a real dev workspace where the actual
+ * tests lived under `Packages/<nested-package>/out`, invisible to the
+ * previous single-outDir mount -- the built place had nothing under the
+ * package-under-test's own node to find, silently.
+ *
+ * Each match's *own* package.json (its immediate parent directory) provides
+ * the scope/name to mount it under, since that's what compiled code
+ * importing it by name actually expects at runtime -- not necessarily its
+ * folder name (e.g. a real nested package's folder was `rbxts-react-clean-ui`
+ * but its package.json `name` was `@rbxts/react-clean-ui`).
+ */
+function findNestedTestPackages(cwd: string, outDirName: string, topLevelOutDir: string): NestedTestPackage[] {
+	const found: NestedTestPackage[] = [];
+	const seen = new Set<string>([path.resolve(topLevelOutDir)]);
+
+	function walk(dir: string): void {
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			if (!entry.isDirectory() || entry.name === 'node_modules' || entry.name === '.git') {
+				continue;
+			}
+			const full = path.join(dir, entry.name);
+			if (entry.name === outDirName) {
+				const resolved = path.resolve(full);
+				if (!seen.has(resolved) && containsLuauFile(full)) {
+					seen.add(resolved);
+					const pkgName = readPackageName(dir);
+					const parsed = parsePackageName(pkgName);
+					if (parsed.name) {
+						found.push({ scope: parsed.scope, name: parsed.name, outDirPath: toForwardSlashes(full) });
+					}
+				}
+				continue; // don't descend into a matched "out" dir looking for more
+			}
+			walk(full);
+		}
+	}
+
+	walk(cwd);
+	return found;
+}
+
 function readPackageName(cwd: string): string {
 	const pkgPath = path.join(cwd, 'package.json');
 	try {
@@ -219,17 +280,20 @@ export function regenerateStudioFiles(config: LunitConfig): { projectFile: strin
 		scopePaths.set(scope, toForwardSlashes(path.join(cwd, NODE_MODULES_RELATIVE, scope)));
 	}
 
+	const nestedPackages = findNestedTestPackages(cwd, path.basename(config.outDir), config.outDir);
+
 	const projectContent = buildStudioProjectFile({
 		rbxtsIncludePath: toForwardSlashes(path.join(cwd, RBXTS_INCLUDE_RELATIVE)),
 		scopePaths,
 		outDirPath: toForwardSlashes(config.outDir),
 		packageScope,
 		packageName,
+		extraPackages: nestedPackages,
 	});
 	fs.writeFileSync(projectFile, projectContent, 'utf8');
 
 	fs.mkdirSync(path.dirname(config.studio.bootstrapScript), { recursive: true });
-	fs.writeFileSync(config.studio.bootstrapScript, buildStudioBootstrapScript(packageScope, packageName), 'utf8');
+	fs.writeFileSync(config.studio.bootstrapScript, buildStudioBootstrapScript(), 'utf8');
 
 	return { projectFile, bootstrapScript: config.studio.bootstrapScript };
 }

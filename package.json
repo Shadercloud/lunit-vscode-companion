@@ -2,7 +2,7 @@
   "name": "vscode-lunit-companion",
   "displayName": "Lunit Test Companion",
   "description": "Discover and run @rbxts/lunit tests from VS Code's Test Explorer.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "ShaderCloud",
   "author": "ShaderCloud",
   "license": "MIT",
