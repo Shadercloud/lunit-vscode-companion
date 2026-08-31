@@ -78,12 +78,27 @@ local lunit = RuntimeLib.import(runtimeLibModule, lunitModule:FindFirstChild("ou
 ${buildLuauEmitHelpers()}
 
 for _, moduleScript in testModules do
-	local loadOk, cls = pcall(RuntimeLib.import, runtimeLibModule, moduleScript)
+	-- require() caches its result per ModuleScript *instance* for the life of
+	-- this Studio session. Live-sync deliberately keeps that session open
+	-- across every run (that's the whole point -- no relaunching Studio), so
+	-- re-requiring the same instance after Rojo updates its Source in place
+	-- (e.g. a newly added @Test method) silently returns the stale,
+	-- already-cached class instead of the edited one -- the test just never
+	-- runs, with nothing in the output to explain why. Cloning gives
+	-- require() an instance it has never seen before, forcing a real
+	-- re-execution of the current Source every time; the clone is parented
+	-- alongside the original (so any relative require() inside the module,
+	-- e.g. a sibling fixture file, still resolves normally) for exactly as
+	-- long as this class's tests take to run, then discarded.
+	local freshModule = moduleScript:Clone()
+	freshModule.Parent = moduleScript.Parent
+	local loadOk, cls = pcall(RuntimeLib.import, runtimeLibModule, freshModule)
 	if not loadOk then
 		warn("failed to load test module \\"" .. moduleScript:GetFullName() .. "\\": " .. tostring(cls))
 	elseif cls ~= nil then
 		lunitRunClass(lunit, cls, tostring(cls))
 	end
+	freshModule:Destroy()
 end
 
 return table.concat(LUNIT_OUTPUT_BUFFER, "\\n")

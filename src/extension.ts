@@ -184,6 +184,10 @@ export function activate(context: vscode.ExtensionContext): void {
 			await discoverAll(controller);
 		}
 	};
+	// Wires up the Test Explorer's own built-in refresh icon (distinct from
+	// the "Lunit: Refresh Tests" command) -- without this, that button is a
+	// no-op and stale items (e.g. a commented-out @Test) never get re-synced.
+	controller.refreshHandler = () => discoverAll(controller);
 
 	// Only one of these two profiles should ever be "default" at a time --
 	// VS Code's own "Select Default Profile" picker lets you check both

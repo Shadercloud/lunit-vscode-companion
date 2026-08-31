@@ -62,6 +62,18 @@ function decodeBase64(value: string): string {
 	return Buffer.from(value, 'base64').toString('utf8');
 }
 
+/**
+ * Luau's `error()` prepends "source:line: " to the message by default (e.g.
+ * `ReplicatedStorage.rbxts_include.node_modules.@rbxts.lunit.out.lib.assert:8:
+ * Expected 50 to equal 10`), pointing at Lunit's own assert helper rather
+ * than anything the user wrote. That location is never useful here -- VS
+ * Code already navigates to the failing test, not to lunit's assert -- so
+ * strip it and keep just the message.
+ */
+function stripLuauLocationPrefix(message: string): string {
+	return message.replace(/^\S+:\d+:\s*/, '');
+}
+
 export function parseResultLines(output: string): ResultRecord[] {
 	const records: ResultRecord[] = [];
 	for (const line of output.split(/\r?\n/)) {
@@ -83,7 +95,7 @@ export function parseResultLines(output: string): ResultRecord[] {
 			label: decodeBase64(labelB64),
 			status,
 			elapsedMs: Number(elapsedStr) || 0,
-			error: errorB64.length > 0 ? decodeBase64(errorB64) : undefined,
+			error: errorB64.length > 0 ? stripLuauLocationPrefix(decodeBase64(errorB64)) : undefined,
 		});
 	}
 	return records;
