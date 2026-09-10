@@ -30,7 +30,7 @@ import {
 } from './studioRunner';
 
 interface TestMeta {
-	kind: 'file' | 'class' | 'test';
+	kind: 'folder' | 'file' | 'class' | 'test';
 	uri: vscode.Uri;
 	className?: string;
 	methodName?: string;
@@ -288,6 +288,9 @@ export function activate(context: vscode.ExtensionContext): void {
 			if (e.affectsConfiguration('lunit.studio.enabled')) {
 				registerStudioProfile();
 			}
+			if (e.affectsConfiguration('lunit.explorer')) {
+				void discoverAll(controller);
+			}
 		}),
 	);
 
@@ -371,10 +374,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		);
 		watcher.onDidCreate((uri) => updateFile(controller, uri));
 		watcher.onDidChange((uri) => updateFile(controller, uri));
-		watcher.onDidDelete((uri) => {
-			metaById.delete(uri.toString());
-			controller.items.delete(uri.toString());
-		});
+		watcher.onDidDelete((uri) => removeFile(controller, uri));
 		context.subscriptions.push(watcher);
 	}
 
@@ -428,9 +428,9 @@ async function runFromCli(
 
 		const requiredTag = request.via === 'lune' ? LUNE_TAG : STUDIO_TAG;
 		const include: vscode.TestItem[] = [];
-		controller.items.forEach((fileItem) => {
+		controller.items.forEach((root) => {
 			const leaves: vscode.TestItem[] = [];
-			collectLeaves(fileItem, leaves);
+			collectLeaves(root, leaves);
 			for (const leaf of leaves) {
 				const identity = identityOf(leaf);
 				if (
@@ -513,27 +513,71 @@ async function updateFile(controller: vscode.TestController, uri: vscode.Uri): P
 
 	const fileId = uri.toString();
 	if (classes.length === 0) {
-		controller.items.delete(fileId);
-		metaById.delete(fileId);
+		removeFile(controller, uri);
 		return;
 	}
 
-	const fileItem = controller.createTestItem(fileId, workspaceRelativeLabel(uri), uri);
+	const explorerCfg = vscode.workspace.getConfiguration('lunit', uri);
+	const humanize = explorerCfg.get<boolean>('explorer.humanizeNames', true);
+	const displayNameIsLabel = explorerCfg.get<string>('explorer.displayName', 'description') === 'label';
+	const pretty = (raw: string) => (humanize ? humanizeIdentifier(raw) : raw);
+	// Label / dimmed-description split for a class or test: by default the
+	// identifier is the label and @DisplayName (or, failing that, the JSDoc
+	// summary) is the description, so a short method name can carry a longer
+	// sentence beside it. With lunit.explorer.displayName = "label",
+	// @DisplayName replaces the label instead, as Lunit's own report shows it.
+	const labelAndSummary = (
+		raw: string,
+		displayName: string | undefined,
+		doc: string | undefined,
+	): { label: string; summary: string | undefined } => {
+		if (displayName !== undefined && displayNameIsLabel) {
+			return { label: displayName, summary: doc };
+		}
+		return { label: pretty(raw), summary: displayName ?? doc };
+	};
+
+	// Label is just the file name; the directory lives on the folder node
+	// above it (see folderItemFor), so the tree reads "Lune > Input.test.ts"
+	// rather than one long workspace-relative path per row.
+	const fileItem = controller.createTestItem(fileId, fileLabel(uri), uri);
 	metaById.set(fileId, { kind: 'file', uri });
 
 	const classItems = classes.map((cls) => {
 		const classId = `${fileId}::${cls.className}`;
-		const classItem = controller.createTestItem(classId, cls.displayName ?? cls.className, uri);
+		const classText = labelAndSummary(cls.className, cls.displayName, cls.doc);
+		const classItem = controller.createTestItem(classId, classText.label, uri);
 		classItem.range = new vscode.Range(cls.line, 0, cls.line, 0);
+		classItem.description = describe(classText.summary, cls.tags, []);
 		metaById.set(classId, { kind: 'class', uri, className: cls.className });
 
 		const testItems = cls.tests.map((test) => {
 			const testId = `${classId}::${test.methodName}`;
-			const label = test.displayName ?? test.methodName;
-			const testItem = controller.createTestItem(testId, label, uri);
+			const testText = labelAndSummary(test.methodName, test.displayName, test.doc);
+			const testItem = controller.createTestItem(testId, testText.label, uri);
 			testItem.range = new vscode.Range(test.line, 0, test.line, 0);
 			const runTags = computeRunTags([...cls.tags, ...test.tags]);
-			testItem.tags = test.hasSkip ? [...runTags, new vscode.TestTag('skip')] : runTags;
+			// Beyond the two run-profile tags, expose the test's own @Tag(...)
+			// values (and skip/only) as VS Code tags so the Test Explorer's
+			// "@lunitTests:<tag>" filter can select by them.
+			const markers: string[] = [];
+			if (test.hasSkip) {
+				markers.push('skip');
+			}
+			if (test.isOnly) {
+				markers.push('only');
+			}
+			if (test.eachCount !== undefined) {
+				markers.push(`each x${test.eachCount}`);
+			}
+			testItem.tags = unionTags([
+				runTags,
+				[...cls.tags, ...test.tags].map((t) => new vscode.TestTag(t)),
+				markers.filter((m) => !m.startsWith('each')).map((m) => new vscode.TestTag(m)),
+			]);
+			// Only show tags declared on the method itself; class-level tags
+			// are already shown on the class row.
+			testItem.description = describe(testText.summary, test.tags, markers);
 			metaById.set(testId, {
 				kind: 'test',
 				uri,
@@ -550,7 +594,95 @@ async function updateFile(controller: vscode.TestController, uri: vscode.Uri): P
 	fileItem.children.replace(classItems);
 	fileItem.tags = unionTags(classItems.map((c) => c.tags));
 
-	controller.items.add(fileItem);
+	const folderItem = folderItemFor(controller, uri);
+	folderItem.children.add(fileItem);
+	folderItem.tags = unionTags(Array.from(folderItem.children, ([, child]) => child.tags));
+}
+
+/** Removes a test file's item (and its now-empty folder node, if any) from the tree. */
+function removeFile(controller: vscode.TestController, uri: vscode.Uri): void {
+	const fileId = uri.toString();
+	metaById.delete(fileId);
+	const folderId = folderIdFor(uri);
+	const folderItem = controller.items.get(folderId);
+	if (!folderItem) {
+		return;
+	}
+	folderItem.children.delete(fileId);
+	if (folderItem.children.size === 0) {
+		controller.items.delete(folderId);
+	} else {
+		folderItem.tags = unionTags(Array.from(folderItem.children, ([, child]) => child.tags));
+	}
+}
+
+function folderIdFor(uri: vscode.Uri): string {
+	return `folder:${vscode.Uri.file(path.dirname(uri.fsPath)).toString()}`;
+}
+
+/**
+ * Root nodes of the tree are one per directory that contains test files:
+ * labelled by the directory's own name (e.g. "Lune", "Studio") with the
+ * workspace-relative path shown dimmed alongside, so two same-named folders
+ * in different packages are still told apart.
+ */
+function folderItemFor(controller: vscode.TestController, fileUri: vscode.Uri): vscode.TestItem {
+	const folderId = folderIdFor(fileUri);
+	const existing = controller.items.get(folderId);
+	if (existing) {
+		return existing;
+	}
+	const dirUri = vscode.Uri.file(path.dirname(fileUri.fsPath));
+	const relative = workspaceRelativeLabel(dirUri);
+	const item = controller.createTestItem(folderId, path.basename(dirUri.fsPath) || relative, dirUri);
+	item.description = relative;
+	controller.items.add(item);
+	return item;
+}
+
+/** Dimmed per-row text: the summary sentence, then the item's own @Tag(...) values, then markers like "skip". */
+function describe(
+	summary: string | undefined,
+	tags: readonly string[],
+	markers: readonly string[],
+): string | undefined {
+	const parts = [...(summary ? [summary] : []), ...tags.map((t) => `@${t}`), ...markers];
+	return parts.length > 0 ? parts.join(' · ') : undefined;
+}
+
+/** "Grid.test.tsx" -> "Grid": the file name without its .test/.spec suffix and extension. */
+function fileLabel(uri: vscode.Uri): string {
+	const base = path.basename(uri.fsPath);
+	const stripped = base.replace(/\.(test|spec)\.[cm]?[jt]sx?$/i, '').replace(/\.[cm]?[jt]sx?$/i, '');
+	return stripped.length > 0 ? stripped : base;
+}
+
+/**
+ * "keepsLastValidTextWhenAnInvalidCharacterIsTyped" -> "Keeps last valid text
+ * when an invalid character is typed" (sentence case); "InputNumberValidation"
+ * -> "Input Number Validation" (a PascalCase name keeps its capitals). Acronyms
+ * stay together ("parsesJSONInput" -> "Parses JSON input"), digits attach to
+ * the preceding word, and underscores/dollars become spaces.
+ */
+export function humanizeIdentifier(name: string): string {
+	const spaced = name
+		.replace(/[_$]+/g, ' ')
+		.replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+		.replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+		.trim();
+	const startsUpper = /^[A-Z]/.test(name);
+	return spaced
+		.split(/\s+/)
+		.map((word, i) => {
+			if (/^[A-Z0-9]{2,}$/.test(word)) {
+				return word; // acronym
+			}
+			if (i === 0) {
+				return word.charAt(0).toUpperCase() + word.slice(1);
+			}
+			return startsUpper ? word : word.charAt(0).toLowerCase() + word.slice(1);
+		})
+		.join(' ');
 }
 
 function workspaceRelativeLabel(uri: vscode.Uri): string {

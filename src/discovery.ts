@@ -3,7 +3,14 @@ import * as ts from 'typescript';
 export interface DiscoveredTest {
 	methodName: string;
 	displayName?: string;
+	/** First paragraph of the method's JSDoc comment, if any. */
+	doc?: string;
 	tags: string[];
+	/**
+	 * True only for an unconditional skip: `@Skip()`, `@Skip(true)` or
+	 * `@Skip(true, "why")`. A conditional `@Skip(someExpression, ...)` is
+	 * decided at run time, so it is NOT flagged here.
+	 */
 	hasSkip: boolean;
 	isOnly: boolean;
 	eachCount?: number;
@@ -13,6 +20,8 @@ export interface DiscoveredTest {
 export interface DiscoveredClass {
 	className: string;
 	displayName?: string;
+	/** First paragraph of the class's JSDoc comment, if any. */
+	doc?: string;
 	tags: string[];
 	line: number;
 	tests: DiscoveredTest[];
@@ -42,6 +51,25 @@ function firstStringArg(args: readonly ts.Expression[]): string | undefined {
 
 function allStringArgs(args: readonly ts.Expression[]): string[] {
 	return args.filter(ts.isStringLiteralLike).map((a) => a.text);
+}
+
+/** True when a `@Skip` decorator's arguments make it unconditional. */
+function isUnconditionalSkip(args: readonly ts.Expression[]): boolean {
+	const condition = args[0];
+	return condition === undefined || condition.kind === ts.SyntaxKind.TrueKeyword;
+}
+
+/** The first paragraph of the JSDoc block attached to `node`, whitespace-collapsed. */
+function jsDocSummary(node: ts.Node): string | undefined {
+	const docs = ts.getJSDocCommentsAndTags(node).filter(ts.isJSDoc);
+	const doc = docs[docs.length - 1];
+	if (!doc || doc.comment === undefined) {
+		return undefined;
+	}
+	const text = typeof doc.comment === 'string' ? doc.comment : ts.getTextOfJSDocComment(doc.comment) ?? '';
+	const firstParagraph = text.split(/\r?\n\s*\r?\n/)[0];
+	const collapsed = firstParagraph.replace(/\s+/g, ' ').trim();
+	return collapsed.length > 0 ? collapsed : undefined;
 }
 
 function getDecorators(node: ts.Node): readonly ts.Decorator[] {
@@ -82,6 +110,7 @@ export function parseTestFile(filePath: string, sourceText: string): DiscoveredC
 		const discoveredClass: DiscoveredClass = {
 			className: statement.name.text,
 			displayName: classDisplayName,
+			doc: jsDocSummary(statement),
 			tags: classTags,
 			line: sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile)).line,
 			tests: [],
@@ -117,7 +146,7 @@ export function parseTestFile(filePath: string, sourceText: string): DiscoveredC
 						tags.push(...allStringArgs(args));
 						break;
 					case 'Skip':
-						hasSkip = true;
+						hasSkip = hasSkip || isUnconditionalSkip(args);
 						break;
 					case 'Only':
 						isOnly = true;
@@ -141,6 +170,7 @@ export function parseTestFile(filePath: string, sourceText: string): DiscoveredC
 			discoveredClass.tests.push({
 				methodName: member.name.text,
 				displayName,
+				doc: jsDocSummary(member),
 				tags,
 				hasSkip,
 				isOnly,

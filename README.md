@@ -69,8 +69,18 @@ profile actually runs things.
 ## What it does
 
 - Scans `**/*.{test,spec}.{ts,tsx}` (configurable) with the TypeScript compiler API and builds a
-  file → class → test tree from `@Test`-decorated methods, honoring `@DisplayName`, `@Tag`, `@Skip`, `@Only`
-  and `@Each` where statically determinable.
+  folder → file → class → test tree from `@Test`-decorated methods, honoring `@DisplayName`, `@Tag`, `@Skip`,
+  `@Only` and `@Each` where statically determinable. The tree is laid out for reading, not for paths: test
+  files are grouped under their directory (shown by name, with the workspace-relative path dimmed beside it)
+  and labelled without their `.test.tsx` suffix, and camelCase names become sentences
+  (`clampsUpToMinWhenTextIsUnderRange` → "Clamps up to min when text is under range"; turn off with
+  `lunit.explorer.humanizeNames`). Keep method names short and put the full sentence in `@DisplayName("...")`
+  (or the method's JSDoc comment): it is shown dimmed beside the name, as in
+  "Active breakpoint  *Cols defaults to one when no breakpoint value resolves*". Set
+  `lunit.explorer.displayName` to `label` if you'd rather `@DisplayName` replace the name, as Lunit's own
+  report does. Each row also shows its own `@Tag` values and `skip` / `only` / `each xN` markers (a
+  conditional `@Skip(condition, ...)` is decided at run time, so it isn't marked), and tags are exposed to the
+  Test Explorer's filter box: type `@lunitTests:Studio` (or `@lunitTests:skip`) to narrow the tree.
 - **Run with Lune**: compiles the project (`npx rbxtsc` by default), regenerates a small generated Lune
   entry script, and runs it, reflecting pass/fail/skip back onto the tree with inline failure messages.
 - **Run in Roblox Studio**: if an already-open Studio instance has this project live-synced via your own
