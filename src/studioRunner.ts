@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import * as vscode from 'vscode';
+import { CancelSignal } from './cancelSignal';
 import { buildStudioBootstrapScript } from './bootstrapTemplate';
 import { LunitConfig } from './config';
 import { LiveSyncBridge } from './liveSyncBridge';
@@ -269,7 +269,7 @@ function readPackageName(cwd: string): string {
  * bootstrap script from the consuming project at all.
  */
 export function regenerateStudioFiles(config: LunitConfig): { projectFile: string; bootstrapScript: string } {
-	const cwd = config.workspaceFolder.uri.fsPath;
+	const cwd = config.workspaceRoot;
 	const projectFile = config.studio.projectFile;
 	fs.mkdirSync(path.dirname(projectFile), { recursive: true });
 
@@ -309,7 +309,7 @@ export function regenerateStudioFiles(config: LunitConfig): { projectFile: strin
 async function runViaLiveSync(
 	config: LunitConfig,
 	bridge: LiveSyncBridge,
-	token: vscode.CancellationToken,
+	token: CancelSignal,
 	onOutput: (chunk: string) => void,
 ): Promise<RunOutcome> {
 	onOutput(
@@ -325,7 +325,7 @@ async function runViaLiveSync(
 	if (!config.skipCompile) {
 		onOutput(`> ${config.compileCommand}\n`);
 		const compileResult = await runCommand(config.compileCommand, {
-			cwd: config.workspaceFolder.uri.fsPath,
+			cwd: config.workspaceRoot,
 			env: config.env,
 			token,
 			onOutput,
@@ -377,11 +377,11 @@ async function runViaLiveSync(
  */
 export async function runViaStudio(
 	config: LunitConfig,
-	token: vscode.CancellationToken,
+	token: CancelSignal,
 	onOutput: (chunk: string) => void,
 	bridge?: LiveSyncBridge,
 ): Promise<RunOutcome> {
-	const cwd = config.workspaceFolder.uri.fsPath;
+	const cwd = config.workspaceRoot;
 	const studio = config.studio;
 
 	if (bridge && config.studio.liveSync.enabled && bridge.isPluginConnected) {

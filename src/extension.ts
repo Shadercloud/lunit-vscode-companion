@@ -2,12 +2,26 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { installAgentInstructions } from './agentInstructions';
-import { getConfig, LunitConfig } from './config';
+import { DEFAULT_LIVE_SYNC_PORT } from './config';
+import { getConfig } from './vscodeConfig';
 import { DiscoveredClass, parseTestFile } from './discovery';
-import { LiveSyncBridge } from './liveSyncBridge';
+import { CliRunRequest, LiveSyncBridge } from './liveSyncBridge';
 import { RunOutcome, runViaLune } from './luneRunner';
-import { aggregateForLabel, createResultLineFilter, parseResultLines, ResultRecord } from './resultProtocol';
+import { createResultLineFilter, parseResultLines, ResultRecord } from './resultProtocol';
 import { isRojoServeRunning } from './rojoDetect';
+import {
+	buildSummary,
+	matchesFilters,
+	resolveVerdict,
+	RunSummary,
+	runsUnder,
+	RunVia,
+	TestIdentity,
+	TestResultEntry,
+	Verdict,
+} from './runReport';
+import { CancelSignal } from './cancelSignal';
+import { writeCliLauncher } from './cliLauncher';
 import {
 	installStudioPlugin,
 	isStudioPluginInstalled,
@@ -27,6 +41,11 @@ let outputChannel: vscode.OutputChannel;
 let extensionContext: vscode.ExtensionContext;
 let liveSyncBridge: LiveSyncBridge | undefined;
 const metaById = new Map<string, TestMeta>();
+/** Resolves once the initial discovery pass (kicked off in activate) has finished. */
+let initialDiscovery: Promise<void> = Promise.resolve();
+/** The two run profiles, kept here so runFromCli can attribute its TestRunRequest to the right one. */
+let luneProfileRef: vscode.TestRunProfile | undefined;
+let studioProfileRef: vscode.TestRunProfile | undefined;
 
 /**
  * Set as each run profile's own `tag` (see createRunProfile's `tag` param),
@@ -46,12 +65,11 @@ const LUNE_TAG = new vscode.TestTag('lunit.lune');
 const STUDIO_TAG = new vscode.TestTag('lunit.studio');
 
 function computeRunTags(effectiveTags: readonly string[]): vscode.TestTag[] {
-	const lower = effectiveTags.map((t) => t.toLowerCase());
 	const tags: vscode.TestTag[] = [];
-	if (!lower.includes('studio')) {
+	if (runsUnder(effectiveTags, 'lune')) {
 		tags.push(LUNE_TAG);
 	}
-	if (!lower.includes('lune')) {
+	if (runsUnder(effectiveTags, 'studio')) {
 		tags.push(STUDIO_TAG);
 	}
 	return tags;
@@ -141,11 +159,21 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.workspace.workspaceFolders?.[0] &&
 		getConfig(vscode.workspace.workspaceFolders[0], getStorageDir(vscode.workspace.workspaceFolders[0])).studio
 			.liveSync.port;
-	liveSyncBridge = new LiveSyncBridge(liveSyncPort ?? 34873, (err) =>
+	liveSyncBridge = new LiveSyncBridge(liveSyncPort ?? DEFAULT_LIVE_SYNC_PORT, (err) =>
 		outputChannel.appendLine(`[lunit] live-sync bridge error: ${err.message}`),
 	);
+	// The command-line route (cli.ts): an agent's `POST /run` on the same
+	// local server ends up in executeRun below, the exact code path a Test
+	// Explorer click takes -- so it produces identical verdicts and the run
+	// shows up in the Testing view as well.
+	liveSyncBridge.runHandler = (request, onOutput, cancel) => runFromCli(controller, request, onOutput, cancel);
 	liveSyncBridge.start();
 	context.subscriptions.push({ dispose: () => liveSyncBridge?.stop() });
+
+	// A stable, version-independent path agents can invoke (see cliLauncher.ts).
+	const cliLauncherPath = writeCliLauncher(context.globalStorageUri.fsPath, context.extensionPath, (message) =>
+		outputChannel.appendLine(message),
+	);
 
 	const statusBarItem = vscode.window.createStatusBarItem('lunit.liveSyncStatus', vscode.StatusBarAlignment.Right, 100);
 	statusBarItem.command = 'lunit.showLiveSyncStatus';
@@ -206,11 +234,12 @@ export function activate(context: vscode.ExtensionContext): void {
 			if (studioProfile) {
 				studioProfile.isDefault = false;
 			}
-			return executeRun(controller, request, token, 'lune');
+			return executeRun(controller, request, token, 'lune').then(() => undefined);
 		},
 		true,
 		LUNE_TAG,
 	);
+	luneProfileRef = luneProfile;
 	context.subscriptions.push(luneProfile);
 	context.subscriptions.push(
 		luneProfile.onDidChangeDefault((isDefault) => {
@@ -231,12 +260,13 @@ export function activate(context: vscode.ExtensionContext): void {
 				(request, token) => {
 					profile.isDefault = true;
 					luneProfile.isDefault = false;
-					return executeRun(controller, request, token, 'studio');
+					return executeRun(controller, request, token, 'studio').then(() => undefined);
 				},
 				false,
 				STUDIO_TAG,
 			);
 			studioProfile = profile;
+			studioProfileRef = profile;
 			context.subscriptions.push(profile);
 			studioDefaultListener = profile.onDidChangeDefault((isDefault) => {
 				if (isDefault) {
@@ -249,6 +279,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			studioDefaultListener = undefined;
 			studioProfile.dispose();
 			studioProfile = undefined;
+			studioProfileRef = undefined;
 		}
 	};
 	registerStudioProfile();
@@ -278,6 +309,18 @@ export function activate(context: vscode.ExtensionContext): void {
 			await vscode.window.showTextDocument(doc);
 		}),
 		vscode.commands.registerCommand('lunit.installStudioPlugin', installPluginInteractive),
+		vscode.commands.registerCommand('lunit.showCliCommand', async () => {
+			const command = cliLauncherPath
+				? `node "${cliLauncherPath}" --studio`
+				: 'the CLI launcher could not be written (see the Lunit output channel)';
+			const choice = await vscode.window.showInformationMessage(
+				`Lunit: agents (or you) can run the tests from any terminal with: ${command}  -- results are identical to the Test Explorer's, and also show up there. Add --lune for the Lune profile, --json for machine-readable output, or test/file name filters.`,
+				...(cliLauncherPath ? ['Copy Command'] : []),
+			);
+			if (choice === 'Copy Command') {
+				await vscode.env.clipboard.writeText(command);
+			}
+		}),
 		vscode.commands.registerCommand('lunit.installAgentInstructions', async () => {
 			const folder = vscode.workspace.workspaceFolders?.[0];
 			if (!folder) {
@@ -285,7 +328,7 @@ export function activate(context: vscode.ExtensionContext): void {
 				return;
 			}
 			const config = getConfig(folder, getStorageDir(folder));
-			const { filePath, updated } = installAgentInstructions(config);
+			const { filePath, updated } = installAgentInstructions(config, cliLauncherPath);
 			const doc = await vscode.workspace.openTextDocument(filePath);
 			await vscode.window.showTextDocument(doc);
 			vscode.window.showInformationMessage(
@@ -335,7 +378,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		context.subscriptions.push(watcher);
 	}
 
-	discoverAll(controller).then(() => {
+	initialDiscovery = discoverAll(controller).then(() => {
 		// Gated on having actually found Lunit tests -- this extension
 		// activates on every VS Code window (onStartupFinished), so without
 		// this check the prompt would show up in unrelated, non-Roblox
@@ -344,6 +387,95 @@ export function activate(context: vscode.ExtensionContext): void {
 			void maybePromptPluginInstall(context);
 		}
 	});
+}
+
+let cliRunInProgress = false;
+
+/**
+ * Entry point for the command-line route (see cli.ts and
+ * LiveSyncBridge.runHandler). Rediscovers tests first so files an agent just
+ * created or edited are picked up even if the file watcher hasn't fired
+ * yet, then hands off to executeRun -- the very same function both Test
+ * Explorer profiles call -- with a real TestRunRequest, so the run is
+ * visible in the Testing view too.
+ */
+async function runFromCli(
+	controller: vscode.TestController,
+	request: CliRunRequest,
+	onOutput: (text: string) => void,
+	cancel: CancelSignal,
+): Promise<RunSummary> {
+	const folder = findWorkspaceFolderContaining(request.cwd);
+	if (!folder) {
+		const known = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath).join(', ') || '(none)';
+		return buildSummary(
+			request.via,
+			[],
+			false,
+			`the Lunit VS Code extension listening on this port belongs to a different workspace (its folders: ${known}), not ${request.cwd}. Run from inside that workspace, or close that window so the CLI can run standalone.`,
+		);
+	}
+	if (request.via === 'studio' && !getConfig(folder, getStorageDir(folder)).studio.enabled) {
+		return buildSummary(request.via, [], false, 'the "Run in Roblox Studio" profile is disabled (lunit.studio.enabled is false).');
+	}
+	if (cliRunInProgress) {
+		return buildSummary(request.via, [], false, 'a command-line test run is already in progress; wait for it to finish.');
+	}
+	cliRunInProgress = true;
+	try {
+		await initialDiscovery;
+		await discoverAll(controller);
+
+		const requiredTag = request.via === 'lune' ? LUNE_TAG : STUDIO_TAG;
+		const include: vscode.TestItem[] = [];
+		controller.items.forEach((fileItem) => {
+			const leaves: vscode.TestItem[] = [];
+			collectLeaves(fileItem, leaves);
+			for (const leaf of leaves) {
+				const identity = identityOf(leaf);
+				if (
+					identity &&
+					leaf.tags.some((t) => t.id === requiredTag.id) &&
+					matchesFilters(identity, request.filters, folder.uri.fsPath)
+				) {
+					include.push(leaf);
+				}
+			}
+		});
+		if (include.length === 0) {
+			const why = request.filters.length > 0 ? ` matching ${request.filters.map((f) => `"${f}"`).join(', ')}` : '';
+			return buildSummary(request.via, [], false, `no ${request.via === 'lune' ? 'Lune' : 'Roblox Studio'} tests were found${why}.`);
+		}
+
+		const profile = request.via === 'lune' ? luneProfileRef : studioProfileRef;
+		const runRequest = new vscode.TestRunRequest(include, undefined, profile);
+		return await executeRun(controller, runRequest, cancel, request.via, onOutput);
+	} finally {
+		cliRunInProgress = false;
+	}
+}
+
+function findWorkspaceFolderContaining(dir: string): vscode.WorkspaceFolder | undefined {
+	const normalize = (p: string) => {
+		const resolved = path.resolve(p).split('\\').join('/').replace(/\/+$/, '');
+		return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+	};
+	const target = normalize(dir);
+	const candidates = (vscode.workspace.workspaceFolders ?? []).filter((folder) => {
+		const root = normalize(folder.uri.fsPath);
+		return target === root || target.startsWith(root + '/');
+	});
+	// Deepest match wins for nested folders in a multi-root workspace.
+	candidates.sort((a, b) => b.uri.fsPath.length - a.uri.fsPath.length);
+	return candidates[0];
+}
+
+function identityOf(leaf: vscode.TestItem): TestIdentity | undefined {
+	const meta = metaById.get(leaf.id);
+	if (!meta || meta.kind !== 'test' || !meta.className || !meta.methodName) {
+		return undefined;
+	}
+	return { file: meta.uri.fsPath, className: meta.className, methodName: meta.methodName, displayName: meta.displayName };
 }
 
 export function deactivate(): void {
@@ -434,12 +566,21 @@ function collectLeaves(item: vscode.TestItem, into: vscode.TestItem[]): void {
 	item.children.forEach((child) => collectLeaves(child, into));
 }
 
+/**
+ * The one and only run path, shared by both Test Explorer profiles and the
+ * command-line route (runFromCli). `onOutput`, when given, receives the
+ * same displayed output the Lunit output channel and Test Results panel
+ * get, and the returned summary carries the same verdict (and message) that
+ * was applied to each TestItem -- via resolveVerdict in runReport.ts, so
+ * neither route can drift from the other.
+ */
 async function executeRun(
 	controller: vscode.TestController,
 	request: vscode.TestRunRequest,
-	token: vscode.CancellationToken,
-	via: 'lune' | 'studio',
-): Promise<void> {
+	token: CancelSignal,
+	via: RunVia,
+	onOutput?: (text: string) => void,
+): Promise<RunSummary> {
 	const run = controller.createTestRun(request);
 	const excluded = new Set((request.exclude ?? []).map((i) => i.id));
 
@@ -470,15 +611,16 @@ async function executeRun(
 
 	if (leaves.length === 0) {
 		run.end();
-		return;
+		return buildSummary(via, [], false, 'no tests to run.');
 	}
 
 	const folder =
 		vscode.workspace.getWorkspaceFolder(leaves[0].uri!) ?? vscode.workspace.workspaceFolders?.[0];
 	if (!folder) {
-		vscode.window.showErrorMessage('Lunit: no workspace folder available to run tests in.');
+		const message = 'Lunit: no workspace folder available to run tests in.';
+		vscode.window.showErrorMessage(message);
 		run.end();
-		return;
+		return buildSummary(via, [], false, message);
 	}
 	const config = getConfig(folder, getStorageDir(folder));
 
@@ -492,79 +634,74 @@ async function executeRun(
 	const displayFilter = createResultLineFilter((text) => {
 		outputChannel.append(text);
 		run.appendOutput(text.replace(/\r?\n/g, '\r\n'));
+		onOutput?.(text);
 	});
-	const onOutput = (chunk: string) => displayFilter.feed(chunk);
+	const chunkSink = (chunk: string) => displayFilter.feed(chunk);
 
 	let outcome: RunOutcome;
 	try {
 		outcome =
 			via === 'lune'
-				? await runViaLune(config, token, onOutput)
-				: await runViaStudio(config, token, onOutput, liveSyncBridge);
+				? await runViaLune(config, token, chunkSink)
+				: await runViaStudio(config, token, chunkSink, liveSyncBridge);
 	} catch (err) {
 		displayFilter.flush();
 		const message = `[lunit] test run failed: ${String(err)}`;
 		outputChannel.appendLine(message);
 		run.appendOutput(message.replace(/\n/g, '\r\n'));
-		for (const leaf of leaves) {
-			run.errored(leaf, new vscode.TestMessage(message));
-		}
+		onOutput?.(message + '\n');
+		const results = applyVerdicts(run, leaves, () => ({ status: 'errored', message }));
 		run.end();
-		return;
+		return buildSummary(via, results, false);
 	}
 	displayFilter.flush();
 
 	if (outcome.cancelled) {
-		for (const leaf of leaves) {
-			run.skipped(leaf);
-		}
+		const results = applyVerdicts(run, leaves, () => ({ status: 'skipped' }));
 		run.end();
-		return;
+		return buildSummary(via, results, true);
 	}
 
 	const records = parseResultLines(outcome.output);
-	applyResults(run, leaves, records, outcome);
+	const results = applyVerdicts(run, leaves, (identity) => resolveVerdict(identity, records, outcome));
 	run.end();
+	return buildSummary(via, results, false);
 }
 
-function applyResults(
+/**
+ * Applies one verdict per leaf onto the VS Code TestRun and returns the same
+ * verdicts as plain data for the run summary. A leaf whose metadata is
+ * somehow missing (shouldn't happen -- every leaf comes from updateFile) is
+ * reported as errored rather than silently dropped.
+ */
+function applyVerdicts(
 	run: vscode.TestRun,
 	leaves: vscode.TestItem[],
-	records: ResultRecord[],
-	outcome: RunOutcome,
-): void {
+	verdictFor: (identity: TestIdentity) => Verdict,
+): TestResultEntry[] {
+	const results: TestResultEntry[] = [];
 	for (const leaf of leaves) {
-		const meta = metaById.get(leaf.id);
-		const baseLabel = meta?.displayName ?? meta?.methodName;
-		const match = meta?.className && baseLabel ? aggregateForLabel(records, meta.className, baseLabel) : undefined;
+		const known = identityOf(leaf);
+		const identity: TestIdentity = known ?? { file: leaf.uri?.fsPath ?? '', className: '', methodName: leaf.label };
+		const verdict: Verdict = known
+			? verdictFor(known)
+			: { status: 'errored', message: 'Test item has no discovery metadata.' };
 
-		if (match) {
-			if (match.status === 'passed') {
-				run.passed(leaf, match.elapsedMs);
-			} else if (match.status === 'failed') {
-				run.failed(leaf, new vscode.TestMessage(match.message ?? 'Test failed'), match.elapsedMs);
-			} else {
+		switch (verdict.status) {
+			case 'passed':
+				run.passed(leaf, verdict.elapsedMs);
+				break;
+			case 'failed':
+				run.failed(leaf, new vscode.TestMessage(verdict.message ?? 'Test failed'), verdict.elapsedMs);
+				break;
+			case 'skipped':
 				run.skipped(leaf);
-			}
-			continue;
+				break;
+			case 'errored':
+				run.errored(leaf, new vscode.TestMessage(verdict.message ?? 'Test errored'));
+				break;
 		}
-
-		if (outcome.timedOut) {
-			run.errored(leaf, new vscode.TestMessage('Run timed out before this test reported a result.'));
-		} else if (outcome.code !== 0 && records.length === 0) {
-			run.errored(
-				leaf,
-				new vscode.TestMessage(
-					'No structured results were found in the run output. Check the Lunit output channel for compile/runtime errors.',
-				),
-			);
-		} else {
-			run.errored(
-				leaf,
-				new vscode.TestMessage(
-					'No matching result found in test output for this item. It may not have run (check that its container/tags are discovered by your bootstrap script), or its class name at runtime does not match what was expected.',
-				),
-			);
-		}
+		results.push({ ...identity, ...verdict });
 	}
+	return results;
 }

@@ -1,10 +1,10 @@
 import * as cp from 'child_process';
-import * as vscode from 'vscode';
+import { CancelSignal } from './cancelSignal';
 
 export interface RunOptions {
 	cwd: string;
 	env?: Record<string, string>;
-	token?: vscode.CancellationToken;
+	token?: CancelSignal;
 	timeoutMs?: number;
 	onOutput?: (chunk: string) => void;
 }

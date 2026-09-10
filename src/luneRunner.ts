@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as vscode from 'vscode';
+import { CancelSignal } from './cancelSignal';
 import { LunitConfig } from './config';
 import { buildLuneRunnerScript } from './luneScriptTemplate';
 import { runCommand } from './processRunner';
@@ -38,10 +38,10 @@ function toLuneRequirePath(fromDir: string, toFileNoExt: string): string | undef
  */
 export async function runViaLune(
 	config: LunitConfig,
-	token: vscode.CancellationToken,
+	token: CancelSignal,
 	onOutput: (chunk: string) => void,
 ): Promise<RunOutcome> {
-	const cwd = config.workspaceFolder.uri.fsPath;
+	const cwd = config.workspaceRoot;
 
 	if (!config.skipCompile) {
 		onOutput(`> ${config.compileCommand}\n`);

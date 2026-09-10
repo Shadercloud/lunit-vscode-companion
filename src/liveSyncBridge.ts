@@ -1,10 +1,28 @@
 import * as http from 'http';
+import { CancelSignal, CancelSource } from './cancelSignal';
+import { RunSummary, RunVia, SUMMARY_MARKER } from './runReport';
 
-/** Structurally compatible with vscode.CancellationToken, without importing `vscode`. */
-export interface CancelSignal {
-	isCancellationRequested: boolean;
-	onCancellationRequested(listener: () => void): { dispose(): void };
+/** Body of a `POST /run` request from the CLI (cli.ts) -- see `LiveSyncBridge.runHandler`. */
+export interface CliRunRequest {
+	/** Absolute directory the CLI was invoked from; the handler maps it to one of its workspace folders. */
+	cwd: string;
+	via: RunVia;
+	/** See runReport.ts's `matchesFilters`. */
+	filters: string[];
 }
+
+/**
+ * Executes one CLI-initiated run end-to-end, streaming human-readable output
+ * to `onOutput` as it happens and resolving with the run's structured
+ * summary once done. Installed by extension.ts, where it goes through the
+ * exact same code path as a Test Explorer run (so results land in the
+ * Testing view too).
+ */
+export type CliRunHandler = (
+	request: CliRunRequest,
+	onOutput: (text: string) => void,
+	cancel: CancelSignal,
+) => Promise<RunSummary>;
 
 /**
  * Local (127.0.0.1-only) HTTP server the companion Studio plugin
@@ -19,6 +37,14 @@ export interface CancelSignal {
  * without the user having to choose.
  */
 export class LiveSyncBridge {
+	/**
+	 * When set, `POST /run` (from cli.ts) is accepted and delegated here. Only
+	 * the VS Code extension installs one -- the CLI's own standalone bridge
+	 * (used when no extension is listening on the port) leaves it unset and
+	 * answers 503, so a second CLI can never accidentally run through a first.
+	 */
+	runHandler: CliRunHandler | undefined;
+
 	private server: http.Server | undefined;
 	private lastPluginSeenAt = 0;
 	private currentJob: { id: string; code: string; resolve: (output: string) => void } | undefined;
@@ -105,6 +131,11 @@ export class LiveSyncBridge {
 			return;
 		}
 
+		if (req.method === 'POST' && req.url === '/run') {
+			this.handleCliRun(req, res);
+			return;
+		}
+
 		if (req.method === 'POST' && req.url === '/result') {
 			let body = '';
 			req.on('data', (chunk: Buffer) => {
@@ -129,5 +160,75 @@ export class LiveSyncBridge {
 
 		res.statusCode = 404;
 		res.end();
+	}
+
+	/**
+	 * Streams the run's output back as plain text as it happens, then a final
+	 * `@@LUNIT_SUMMARY@@{json}` line (see runReport.ts). The client hanging up
+	 * mid-run (Ctrl+C in the terminal) cancels the run, exactly like the
+	 * Test Explorer's own stop button.
+	 */
+	private handleCliRun(req: http.IncomingMessage, res: http.ServerResponse): void {
+		let body = '';
+		req.on('data', (chunk: Buffer) => {
+			body += chunk.toString('utf8');
+		});
+		req.on('end', () => {
+			const handler = this.runHandler;
+			if (!handler) {
+				res.statusCode = 503;
+				res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+				res.end('The process listening on this port is not the Lunit VS Code extension (it cannot accept test runs).');
+				return;
+			}
+			let request: CliRunRequest;
+			try {
+				const parsed = JSON.parse(body) as Partial<CliRunRequest>;
+				if (typeof parsed.cwd !== 'string' || (parsed.via !== 'lune' && parsed.via !== 'studio')) {
+					throw new Error('missing cwd/via');
+				}
+				request = { cwd: parsed.cwd, via: parsed.via, filters: Array.isArray(parsed.filters) ? parsed.filters.map(String) : [] };
+			} catch {
+				res.statusCode = 400;
+				res.end('Malformed /run request body.');
+				return;
+			}
+
+			res.statusCode = 200;
+			res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+			res.setHeader('Cache-Control', 'no-cache');
+			res.setHeader('X-Content-Type-Options', 'nosniff');
+			res.flushHeaders();
+
+			const cancel = new CancelSource();
+			res.on('close', () => {
+				if (!res.writableFinished) {
+					cancel.cancel();
+				}
+			});
+
+			handler(request, (text) => {
+				if (!res.writableEnded) {
+					res.write(text);
+				}
+			}, cancel.token)
+				.then((summary) => {
+					if (!res.writableEnded) {
+						res.end(`\n${SUMMARY_MARKER}${JSON.stringify(summary)}\n`);
+					}
+				})
+				.catch((err: unknown) => {
+					if (!res.writableEnded) {
+						const summary: RunSummary = {
+							via: request.via,
+							cancelled: false,
+							tests: [],
+							counts: { passed: 0, failed: 0, skipped: 0, errored: 0 },
+							error: err instanceof Error ? err.message : String(err),
+						};
+						res.end(`\n${SUMMARY_MARKER}${JSON.stringify(summary)}\n`);
+					}
+				});
+		});
 	}
 }

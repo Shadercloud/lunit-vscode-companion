@@ -218,13 +218,55 @@ class MountsAComponent {
 export = MountsAComponent;
 ```
 
+## Running tests from the command line (for coding agents)
+
+Nothing outside VS Code can press the Test Explorer's Run button, so the extension ships a command-line
+entry point that runs the tests the same way and prints the same results. Run **Lunit: Show Command-Line
+Test Command** from the Command Palette to get the exact command for your machine (it has a Copy button);
+it looks like:
+
+```sh
+node "<VS Code user data>/globalStorage/shadercloud.vscode-lunit-companion/lunit-cli.js" --studio
+```
+
+That launcher is a one-line file the extension rewrites on every activation to point at the currently
+installed version, so the path stays stable across extension updates. Options:
+
+- `--studio` (default) is "Run in Roblox Studio"; `--lune` is "Run with Lune".
+- Any other arguments are filters: case-insensitive substrings matched against each test's
+  workspace-relative file path, class name, method name and display name (a test runs if any filter
+  matches). `... --studio MyFeature` or `... --studio src/foo.test.ts`, for example.
+- `--json` prints the run summary as JSON on stdout (the live output moves to stderr), with one entry per
+  test (`file`, `className`, `methodName`, `displayName`, `status`, `message`, `elapsedMs`) plus `counts`.
+- Exit code 0 = every test passed or was skipped, 1 = at least one failed or errored, 2 = the run couldn't be
+  performed at all (the reason is printed), 130 = cancelled with Ctrl+C.
+- `--help` lists everything, including `--port`, `--workspace` and `--standalone`.
+
+How it works, and why the results are identical to clicking in the Test Explorer:
+
+1. **Through the running VS Code window (the normal case).** The CLI posts the run to the same local HTTP
+   server the Studio plugin polls (`lunit.studio.liveSync.port`), and the extension executes it through the
+   very same function a Test Explorer click invokes -- same discovery, same compile, same live-sync-or-launch
+   decision, same result parsing, same per-test verdicts and failure messages. Output streams back to the
+   terminal live, and the run also shows up in the Testing view. Ctrl+C cancels it like the Stop button.
+   If the window listening on the port has a *different* workspace open, the CLI says so and exits 2 rather
+   than running the wrong project's tests.
+2. **Standalone (no VS Code window open).** The CLI reads the same `lunit.*` settings from the workspace's
+   `.vscode/settings.json` (user-level settings aren't visible to it), discovers tests with the same parser,
+   temporarily hosts the live-sync server itself so an already-open Studio with the plugin connects to *it*,
+   and calls the same runner modules. Generated files go to a per-project folder under the OS temp directory
+   instead of VS Code's extension storage.
+
+Only one command-line run at a time is accepted per window.
+
 ## Using a coding agent to write tests
 
 Run **Lunit: Add/Update Agent Instructions (AGENTS.md)** from the Command Palette to generate (or update) an
 `AGENTS.md` section at your workspace root explaining, to any coding agent that reads it (Claude Code and
 others that follow the `AGENTS.md` convention), how `@rbxts/lunit` tests are structured, the
-`@Tag("Studio")`/`@Tag("Lune")` convention above, and why it shouldn't try to invoke the test runner itself
-(see [Lune profile](#lune-profile) for why a hand-rolled invocation doesn't work). This is the one thing the
+`@Tag("Studio")`/`@Tag("Lune")` convention above, the exact command-line invocation above (with this
+machine's launcher path filled in) for verifying its work, and why it shouldn't try to hand-roll a runner
+invocation instead (see [Lune profile](#lune-profile) for why that doesn't work). This is the one thing the
 extension writes into your project rather than its own storage -- unlike everything else here, it's meant to
 be committed and read by tools that only look at the project, not VS Code's internals. Opt-in only; nothing
 is written automatically. Re-running the command updates only the marked section it owns, leaving the rest of
