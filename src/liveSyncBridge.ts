@@ -1,4 +1,5 @@
 import * as http from 'http';
+import { randomUUID } from 'crypto';
 import { CancelSignal, CancelSource } from './cancelSignal';
 import { RunSummary, RunVia, SUMMARY_MARKER } from './runReport';
 
@@ -24,6 +25,9 @@ export type CliRunHandler = (
 	cancel: CancelSignal,
 ) => Promise<RunSummary>;
 
+export const BRIDGE_PORT_COUNT = 20;
+export interface BridgeWorkspace { name: string; path: string }
+
 /**
  * Local (127.0.0.1-only) HTTP server the companion Studio plugin
  * (studioPluginTemplate.ts) polls for on-demand test-run jobs. Deliberately
@@ -46,13 +50,19 @@ export class LiveSyncBridge {
 	runHandler: CliRunHandler | undefined;
 
 	private server: http.Server | undefined;
+	private retryTimer: ReturnType<typeof setTimeout> | undefined;
+	private listenError: NodeJS.ErrnoException | undefined;
 	private lastPluginSeenAt = 0;
 	private currentJob: { id: string; code: string; delivered: boolean; resolve: (output: string) => void } | undefined;
 	private jobCounter = 0;
+	private candidatePort = this.port;
+	private readonly instanceId = randomUUID();
 
 	constructor(
 		private readonly port: number,
 		private readonly onError?: (err: Error) => void,
+		private readonly retryDelayMs = 0,
+		private readonly workspaces?: BridgeWorkspace[],
 	) {}
 
 	start(): void {
@@ -60,19 +70,51 @@ export class LiveSyncBridge {
 			return;
 		}
 		const server = http.createServer((req, res) => this.handleRequest(req, res));
-		server.on('error', (err) => this.onError?.(err));
-		server.listen(this.port, '127.0.0.1');
 		this.server = server;
+		server.on('listening', () => { this.listenError = undefined; });
+		server.on('error', (err: NodeJS.ErrnoException) => {
+			if (this.server !== server) { return; }
+			if (err.code === 'EADDRINUSE' && this.workspaces && this.candidatePort < Math.min(65535, this.port + BRIDGE_PORT_COUNT - 1)) {
+				server.listen(++this.candidatePort, '127.0.0.1');
+				return;
+			}
+			const changed = this.listenError?.message !== err.message;
+			this.listenError = err;
+			if (err.code === 'EADDRINUSE' && this.retryDelayMs > 0 && !this.retryTimer) {
+				this.retryTimer = setTimeout(() => {
+					this.retryTimer = undefined;
+					this.candidatePort = this.port;
+					if (this.server === server) { server.listen(this.candidatePort, '127.0.0.1'); }
+				}, this.retryDelayMs);
+				this.retryTimer.unref();
+			}
+			if (changed) { this.onError?.(err); }
+		});
+		this.candidatePort = this.port;
+		server.listen(this.candidatePort, '127.0.0.1');
 	}
 
 	stop(): void {
+		clearTimeout(this.retryTimer);
+		this.retryTimer = undefined;
 		this.server?.close();
 		this.server = undefined;
+		this.listenError = undefined;
+		this.lastPluginSeenAt = 0;
+	}
+
+	get connectionError(): string | undefined {
+		if (!this.listenError) { return undefined; }
+		if (this.listenError.code === 'EADDRINUSE') {
+			if (this.workspaces) { return `All Studio bridge ports ${this.port}-${Math.min(65535, this.port + BRIDGE_PORT_COUNT - 1)} are occupied. Close unused VS Code windows, or change lunit.studio.liveSync.port and reinstall the Studio plugin. Retrying automatically.`; }
+			return `Port ${this.port} is already in use by another process (often another VS Code window). This window cannot receive Studio polls. Close the other window or disable Lunit there, then reload this window if needed. Alternatively, change lunit.studio.liveSync.port, reload this window, and reinstall and reload the Studio plugin to match.`;
+		}
+		return `Cannot start the Studio bridge on 127.0.0.1:${this.port}: ${this.listenError.message}`;
 	}
 
 	/** True once the plugin has polled recently enough to be considered live right now. */
 	get isPluginConnected(): boolean {
-		return this.server !== undefined && (this.currentJob?.delivered === true || Date.now() - this.lastPluginSeenAt < 5000);
+		return this.server?.listening === true && (this.currentJob?.delivered === true || Date.now() - this.lastPluginSeenAt < 5000);
 	}
 
 	/**
@@ -135,7 +177,21 @@ export class LiveSyncBridge {
 	}
 
 	private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-		if (req.method === 'GET' && req.url === '/poll') {
+		const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+		if (req.method === 'GET' && url.pathname === '/info') {
+			res.setHeader('Content-Type', 'application/json');
+			res.end(JSON.stringify({ protocol: 'lunit-bridge-1', instanceId: this.instanceId,
+				workspaces: this.workspaces ?? [], pid: process.pid, acceptsRuns: !!this.runHandler }));
+			return;
+		}
+		// A selected window's port can be reused after it exits. Never accept
+		// a stale selection as a heartbeat or deliver a different window's job.
+		if (url.searchParams.has('instanceId') && url.searchParams.get('instanceId') !== this.instanceId) {
+			res.statusCode = 409;
+			res.end('The selected VS Code window has closed. Select a window again in Studio.');
+			return;
+		}
+		if (req.method === 'GET' && url.pathname === '/poll') {
 			this.lastPluginSeenAt = Date.now();
 			res.setHeader('Content-Type', 'application/json');
 			const job = this.currentJob;
@@ -149,12 +205,12 @@ export class LiveSyncBridge {
 			return;
 		}
 
-		if (req.method === 'POST' && req.url === '/run') {
+		if (req.method === 'POST' && url.pathname === '/run') {
 			this.handleCliRun(req, res);
 			return;
 		}
 
-		if (req.method === 'POST' && req.url === '/result') {
+		if (req.method === 'POST' && url.pathname === '/result') {
 			let body = '';
 			req.on('data', (chunk: Buffer) => {
 				body += chunk.toString('utf8');

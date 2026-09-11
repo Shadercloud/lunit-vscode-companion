@@ -2,7 +2,7 @@
   "name": "vscode-lunit-companion",
   "displayName": "Lunit Test Companion",
   "description": "Discover and run @rbxts/lunit tests from VS Code's Test Explorer.",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "publisher": "ShaderCloud",
   "author": "ShaderCloud",
   "license": "MIT",
@@ -82,7 +82,10 @@
         },
         "lunit.explorer.displayName": {
           "type": "string",
-          "enum": ["description", "label"],
+          "enum": [
+            "description",
+            "label"
+          ],
           "enumDescriptions": [
             "The method/class name is the row's label and @DisplayName(\"...\") is shown dimmed beside it as a description (falling back to the first paragraph of the JSDoc comment). Lets you keep method names short and put the full sentence in @DisplayName.",
             "@DisplayName(\"...\") replaces the row's label, matching how Lunit's own console report names the test. The JSDoc comment, if any, becomes the description."
@@ -178,7 +181,9 @@
         "lunit.studio.liveSync.port": {
           "type": "number",
           "default": 34873,
-          "description": "Port the extension's local (127.0.0.1-only) live-sync server listens on, and the companion Studio plugin polls. Change this if the port is already in use -- you'll also need to reinstall the plugin afterward so it picks up the new port."
+          "minimum": 1024,
+          "maximum": 65516,
+          "description": "First port in the 20-port localhost discovery range. Each VS Code window takes a free port; select the target workspace using Lunit in Studio. Use the same range in your workspaces. After changing this, reload VS Code and reinstall and reload the Studio plugin."
         },
         "lunit.studio.liveSync.timeoutSeconds": {
           "type": "number",

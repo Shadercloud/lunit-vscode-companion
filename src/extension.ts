@@ -150,17 +150,16 @@ export function activate(context: vscode.ExtensionContext): void {
 
 	// Started once, for the whole session (not per-run), so isPluginConnected
 	// reflects reality *before* the user asks to run anything -- see
-	// studioRunner.ts's runViaStudio for why that matters. The port is a
-	// per-workspace-folder setting in principle, but the bridge itself is one
-	// process-wide server; the first folder's value (or the default) is used
-	// for the whole session, matching the fact that the companion Studio
-	// plugin's URL is baked in at install time regardless.
+	// studioRunner.ts's runViaStudio for why that matters. The first folder's
+	// configured port starts the discovery range. Each window takes a free
+	// port in that range and Studio explicitly selects a window by identity.
 	const liveSyncPort =
 		vscode.workspace.workspaceFolders?.[0] &&
 		getConfig(vscode.workspace.workspaceFolders[0], getStorageDir(vscode.workspace.workspaceFolders[0])).studio
 			.liveSync.port;
 	liveSyncBridge = new LiveSyncBridge(liveSyncPort ?? DEFAULT_LIVE_SYNC_PORT, (err) =>
-		outputChannel.appendLine(`[lunit] live-sync bridge error: ${err.message}`),
+		outputChannel.appendLine(`[lunit] live-sync bridge error: ${err.message}`), 2000,
+		(vscode.workspace.workspaceFolders ?? []).map(folder => ({ name: folder.name, path: folder.uri.fsPath })),
 	);
 	// The command-line route (cli.ts): an agent's `POST /run` on the same
 	// local server ends up in executeRun below, the exact code path a Test
@@ -183,6 +182,13 @@ export function activate(context: vscode.ExtensionContext): void {
 	// running is its own warning (see showLiveSyncStatus), not the same as
 	// "fully working".
 	const refreshStatusBar = async () => {
+		const connectionError = liveSyncBridge?.connectionError;
+		if (connectionError) {
+			statusBarItem.text = '$(error) Lunit: Studio bridge unavailable';
+			statusBarItem.tooltip = connectionError;
+			statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+			return;
+		}
 		const connected = liveSyncBridge?.isPluginConnected ?? false;
 		const rojoRunning = connected ? await isRojoServeRunning() : false;
 		if (connected && rojoRunning) {
@@ -198,7 +204,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		} else {
 			statusBarItem.text = '$(beaker) Lunit: Studio not connected';
 			statusBarItem.tooltip =
-				'No Roblox Studio instance is currently connected for live-sync. "Run in Roblox Studio" will build a place and launch a new Studio process instead. Click for details.';
+				'In Studio, click Lunit and select this workspace. No Studio instance is currently connected to this window. Click for details.';
 			statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
 		}
 	};
@@ -339,6 +345,10 @@ export function activate(context: vscode.ExtensionContext): void {
 			);
 		}),
 		vscode.commands.registerCommand('lunit.showLiveSyncStatus', async () => {
+			if (liveSyncBridge?.connectionError) {
+				vscode.window.showErrorMessage(`Lunit: ${liveSyncBridge.connectionError}`);
+				return;
+			}
 			const connected = liveSyncBridge?.isPluginConnected ?? false;
 			const installed = isStudioPluginInstalled();
 
@@ -357,11 +367,11 @@ export function activate(context: vscode.ExtensionContext): void {
 			}
 
 			const message = installed
-				? 'Lunit: the live-sync plugin is installed but no Roblox Studio instance is currently polling (Studio may not be open, or the plugin\'s toggle may be paused). "Run in Roblox Studio" will build a place and launch a new Studio process instead.'
+				? 'Lunit: no Studio instance is connected to this VS Code window. In Studio, click Lunit and select this workspace. If the connection window is missing, reinstall and reload the Studio plugin. "Run in Roblox Studio" will otherwise build a place and launch a new Studio process.'
 				: 'Lunit: the Roblox Studio live-sync plugin isn\'t installed yet. Without it, "Run in Roblox Studio" builds a place and launches a new Studio process every run instead of using one you already have open.';
 			const action = installed ? undefined : 'Install Plugin';
 			const choice = await vscode.window.showWarningMessage(message, ...(action ? [action] : []));
-			if (choice === action) {
+			if (action && choice === action) {
 				await installPluginInteractive();
 			}
 		}),

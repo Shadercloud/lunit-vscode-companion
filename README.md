@@ -11,7 +11,8 @@ Test Explorer (or set one as the default via the profile picker's gear icon).
 If you ever run tests in Roblox Studio, do this now: run **Lunit: Install Roblox Studio Live-Sync Plugin**
 from the Command Palette (you'll also be prompted for this automatically the first time the extension finds
 Lunit tests in a workspace). It's a small 🧪 toolbar button that installs once into Studio's Plugins folder
-and polls quietly in the background from then on -- no per-project setup, nothing to reinstall later.
+and runs in Edit mode. After installation or an update, reload the plugin in Studio, then click
+**Lunit** and select the workspace you want to run tests from.
 
 **Without it**, "Run in Roblox Studio" still works, but it builds a fresh place and launches a brand-new
 Studio process on *every single run* -- slow, and useless if you already have Studio open with your project
@@ -21,6 +22,30 @@ directly in that already-open instance instead: faster, and it doesn't even requ
 Check whether it's connected any time via the **Lunit: Studio connected / not connected** status bar item
 (bottom right) -- click it for details, including a one-click install if it's missing. See
 [Roblox Studio profile](#roblox-studio-profile) below for exactly how the two modes differ.
+
+On plugin startup, Lunit automatically reconnects to your last selected workspace, identified by its
+folder paths rather than its port or process ID. If unavailable, it connects to the first available
+VS Code window (the lowest port in its discovery range), keeping the saved preference for next time.
+Your selection is saved in Studio's local plugin settings. The panel stays closed. If no window is available during
+that startup scan, open Lunit and click **Refresh**, then **Connect** when your project is ready.
+
+**Multiple VS Code windows:** Studio's **Lunit** button opens a dockable **Lunit — Connect to VS Code**
+panel immediately. It shows discovery progress, then workspace names, full paths, and process IDs.
+Click **Connect** beside your workspace. Use **Stop** to pause polling while keeping your selected workspace, **Start** to reconnect, and **Refresh** to scan again.
+You can leave the panel open; closing it does not disconnect. Switch windows when no request or test
+run is in progress. The selected entry is marked **Selected** and logged in Studio Output. Re-select after
+the selected VS Code window reloads; a reused port never silently selects a different window. Reloading
+the Studio plugin starts a fresh automatic selection. Manual selection or Start/Stop overrides an
+automatic selection that is still in progress.
+The previous window's status can take up to five seconds to expire after switching or stopping.
+
+Each window automatically takes a free port in `34873`–`34892`. To use another discovery range, set
+`lunit.studio.liveSync.port`, reload VS Code, then reinstall and reload the plugin to match.
+All windows you want to discover should use the same range. The CLI discovers the window containing
+its working directory; if multiple windows contain the same project, use `--port` to choose one.
+Upgrade both the extension and Studio plugin for the picker: older plugins still poll only the base
+port, and older extensions do not appear in the picker. Rojo syncing uses a separate connection.
+For connection errors, click the VS Code Lunit status bar item and check Studio's Output panel.
 
 ## Quick Start
 
@@ -254,16 +279,16 @@ installed version, so the path stays stable across extension updates. Options:
 
 How it works, and why the results are identical to clicking in the Test Explorer:
 
-1. **Through the running VS Code window (the normal case).** The CLI posts the run to the same local HTTP
-   server the Studio plugin polls (`lunit.studio.liveSync.port`), and the extension executes it through the
+1. **Through the running VS Code window (the normal case).** The CLI discovers the window whose workspace
+   contains its working directory and posts the run to that window's HTTP server. The extension executes it through the
    very same function a Test Explorer click invokes -- same discovery, same compile, same live-sync-or-launch
    decision, same result parsing, same per-test verdicts and failure messages. Output streams back to the
    terminal live, and the run also shows up in the Testing view. Ctrl+C cancels it like the Stop button.
-   If the window listening on the port has a *different* workspace open, the CLI says so and exits 2 rather
-   than running the wrong project's tests.
+   The most specific matching workspace wins; duplicate windows require an explicit `--port`.
+   Legacy extensions still use the configured base port and reject runs from unrelated workspaces.
 2. **Standalone (no VS Code window open).** The CLI reads the same `lunit.*` settings from the workspace's
    `.vscode/settings.json` (user-level settings aren't visible to it), discovers tests with the same parser,
-   temporarily hosts the live-sync server itself so an already-open Studio with the plugin connects to *it*,
+   briefly offers its own live-sync server for Studio selection, falling back to build-and-launch if unselected,
    and calls the same runner modules. Generated files go to a per-project folder under the OS temp directory
    instead of VS Code's extension storage.
 

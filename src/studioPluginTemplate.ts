@@ -20,28 +20,9 @@
  * unauthenticated, same as Rojo's own `rojo serve` -- a deliberate, common
  * localhost-only trust boundary, not an oversight.
  *
- * The toolbar icon is one of Roblox Studio's own bundled icons, referenced
- * via `rbxasset://` -- no upload, no local image file, no network access
- * needed, so it's guaranteed to actually load. Modeled directly on
- * https://github.com/Shadercloud/rbxts-react-screenshot-plugin's own
- * `TOOLBAR_ICON` (a bundled Camera icon), including its finding that an
- * unrelated "Unable to load plugin icon. Image may have an invalid or
- * unknown format." line shows up in the Output panel regardless of this
- * icon -- confirmed there even with the toolbar icon left completely blank,
- * so it's not a symptom of anything wrong with this one either.
- *
- * A hand-generated local PNG file was tried first and rendered as a tiny,
- * indistinct circle in Studio's toolbar -- almost certainly Studio's default
- * placeholder for a custom icon it couldn't actually load via that
- * mechanism, not the real image, matching why the reference plugin above
- * avoided local/custom icons entirely. There's no literal test tube/flask/
- * beaker among Studio's ~2,400 bundled icons (checked directly against a
- * real Studio install's own `content/studio_svg_textures/` folder); this is
- * `TestService`'s icon (a checkmark in a circle) -- Roblox's own closest
- * "testing"-flavored one.
  */
-const TOOLBAR_ICON = 'rbxasset://studio_svg_textures/Shared/InsertableObjects/Dark/Standard/TestService.png';
-
+import { buildStudioPickerScript } from './studioPickerTemplate';
+const TOOLBAR_ICON = 'rbxassetid://14098599607';
 export function buildStudioPluginScript(port: number): string {
 	return `--!strict
 -- Lunit Studio Bridge -- installed by the "Lunit: Install Roblox Studio
@@ -50,28 +31,23 @@ export function buildStudioPluginScript(port: number): string {
 
 local HttpService = game:GetService("HttpService")
 
-local BASE_URL = "http://127.0.0.1:${port}"
+local BASE_PORT = ${port}
 local POLL_INTERVAL_SECONDS = 1.5
 
 local toolbar = plugin:CreateToolbar("Lunit")
-local toggleButton = toolbar:CreateButton(
-	"LunitBridgeToggle",
-	"Lunit test bridge: polling for VS Code test runs. Click to pause/resume.",
-	"${TOOLBAR_ICON}",
-	"Lunit"
-)
-
-local running = true
-toggleButton:SetActive(running)
-
-toggleButton.Click:Connect(function()
-	running = not running
-	toggleButton:SetActive(running)
-end)
+local running = false
 
 local alive = true
 local activeOwner = nil
 local activeThread = nil
+local selected = nil
+local busy = false
+local connectionWarning = false
+local selectButton = toolbar:CreateButton("LunitOpenConnection", "Open Lunit bridge connection settings", "${TOOLBAR_ICON}", "Lunit")
+selectButton.ClickableWhenViewportHidden = true
+${buildStudioPickerScript()}
+
+print("[lunit] Connecting automatically. Click Lunit to manage the bridge connection.")
 
 local function runJob(code: string): string
 	local fn, compileErr = loadstring(code)
@@ -90,15 +66,31 @@ local function runJob(code: string): string
 end
 
 local function poll()
+	local target = selected
+	if not target then return end
+	local query = "?instanceId=" .. HttpService:UrlEncode(target.instanceId)
 	local requestOk, response = pcall(function()
 		return HttpService:RequestAsync({
-			Url = BASE_URL .. "/poll",
+			Url = target.baseUrl .. "/poll" .. query,
 			Method = "GET",
 		})
 	end)
 	if not requestOk or not response.Success then
+		if not connectionWarning then
+			warn("[lunit] Cannot reach selected VS Code window: " .. target.label .. ". " .. tostring(requestOk and response.StatusCode or response))
+			connectionWarning = true
+			updateConnectionStatus("Cannot reach selected workspace. Reopen it or select another workspace.")
+		end
+		if requestOk and response.StatusCode == 409 then
+			selected = nil
+			running = false
+			updateConnectionStatus("Selected window closed or reloaded. Click Refresh and connect again.")
+			warn("[lunit] The selected window has closed or reloaded. Click Lunit to select it again.")
+		end
 		return
 	end
+	connectionWarning = false
+	updateConnectionStatus("Connected: " .. target.label)
 
 	local decodeOk, body = pcall(function()
 		return HttpService:JSONDecode(response.Body)
@@ -114,19 +106,21 @@ local function poll()
 	while alive do
 		local sent, response = pcall(function()
 			return HttpService:RequestAsync({
-				Url = BASE_URL .. "/result",
+				Url = target.baseUrl .. "/result" .. query,
 				Method = "POST",
 				Headers = { ["Content-Type"] = "application/json" },
 				Body = HttpService:JSONEncode({ jobId = body.jobId, output = output }),
 			})
 		end)
-		if sent and response.Success then break end
+		if sent and (response.Success or response.StatusCode == 409) then break end
 		task.wait(POLL_INTERVAL_SECONDS)
 	end
 end
 
 plugin.Unloading:Connect(function()
 	alive = false
+	cancelDiscovery()
+	widget:Destroy()
 	if activeThread then pcall(task.cancel, activeThread) end
 	if activeOwner and activeOwner.cleanup then pcall(activeOwner.cleanup) end
 	activeOwner = nil
@@ -134,8 +128,11 @@ end)
 
 activeThread = task.defer(function()
 	while alive do
-		if running then
-			poll()
+		if running and selected then
+			busy = true
+			local ok, failure = pcall(poll)
+			busy = false
+			if not ok then warn("[lunit] Bridge error: " .. tostring(failure)) end
 		end
 		task.wait(POLL_INTERVAL_SECONDS)
 	end

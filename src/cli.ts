@@ -8,20 +8,19 @@
  *
  * Two ways it can execute, tried in order:
  *
- * 1. Through the running VS Code extension. If a Lunit extension is listening
- *    on the live-sync port (it always is, while a window with this workspace
- *    is open), the run is posted to it (`POST /run`, see liveSyncBridge.ts)
+ * 1. Through the running VS Code extension. Discovery finds the window whose
+ *    workspace contains the current directory. The run is posted to that
+ *    window (`POST /run`, see liveSyncBridge.ts)
  *    and executed by extension.ts's `executeRun` -- the exact same function a
  *    Test Explorer click invokes -- with output streamed back live. The run
  *    also appears in the Testing view. This is the normal case for an agent
- *    working inside VS Code's integrated terminal, and the reason the
- *    extension is the one holding the port: a second process can't bind it,
- *    and the Studio plugin only ever polls one.
+ *    working inside VS Code's integrated terminal. Each window owns a
+ *    different port in the configured discovery range.
  *
  * 2. Standalone, when nothing is listening: reads `.vscode/settings.json`
  *    for the same `lunit.*` settings, discovers tests with the same parser,
- *    starts its own live-sync bridge on the port (so an open Studio with
- *    the plugin connects to *it*), and calls the very same
+ *    briefly offers its own live-sync bridge for Studio selection, then
+ *    falls back to build-and-launch if unselected, and calls the very same
  *    runViaStudio/runViaLune the extension does, resolving verdicts with the
  *    same resolveVerdict. Same code, same results, just no Testing view.
  *
@@ -35,6 +34,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CancelSource } from './cancelSignal';
 import { buildConfig, DEFAULT_LIVE_SYNC_PORT, LunitConfig, SettingReader } from './config';
+import { discoverBridges, matchingBridges } from './bridgeDiscovery';
 import { parseTestFile } from './discovery';
 import { CliRunRequest, LiveSyncBridge } from './liveSyncBridge';
 import { RunOutcome, runViaLune } from './luneRunner';
@@ -73,7 +73,7 @@ Options:
   --studio          Run in Roblox Studio (default) -- same as "Run in Roblox Studio".
   --lune            Run headlessly with Lune -- same as "Run with Lune".
   --json            Print the run summary as JSON on stdout (live output goes to stderr).
-  --port <n>        Live-sync port (default: lunit.studio.liveSync.port, or ${DEFAULT_LIVE_SYNC_PORT}).
+  --port <n>        Select an exact window port (otherwise discover from lunit.studio.liveSync.port or ${DEFAULT_LIVE_SYNC_PORT}).
   --workspace <dir> Workspace folder to use when running standalone (default: nearest
                     ancestor of the current directory containing package.json).
   --standalone      Don't route through a running VS Code window even if one is listening.
@@ -381,6 +381,7 @@ function runThroughExtension(
 	request: CliRunRequest,
 	onOutput: (text: string) => void,
 	cancel: CancelSource,
+	instanceId?: string,
 ): Promise<ExtensionRunResult> {
 	return new Promise((resolve) => {
 		const body = JSON.stringify(request);
@@ -389,7 +390,7 @@ function runThroughExtension(
 				host: '127.0.0.1',
 				port,
 				method: 'POST',
-				path: '/run',
+				path: '/run' + (instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : ''),
 				headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
 			},
 			(res) => {
@@ -567,7 +568,19 @@ async function main(): Promise<number> {
 	let cancelledByUser = false;
 
 	if (!args.standalone) {
-		const result = await runThroughExtension(port, { cwd: args.workspace ?? cwd, via: args.via, filters: args.filters }, live, cancel);
+		const discovered = await discoverBridges(port, args.port === undefined ? undefined : 1);
+		const matches = matchingBridges(discovered, args.workspace ?? cwd);
+		if (matches.length > 1) {
+			live(`[lunit] Multiple VS Code windows contain this workspace. Use --port with one of: ${matches.map(b => b.port).join(', ')}.\n`);
+			process.off('SIGINT', onSigint);
+			return 2;
+		}
+		const target = matches[0];
+		// Preserve legacy extensions and explicit --port. Never send a run to
+		// a discovered modern window that belongs to an unrelated workspace.
+		const result: ExtensionRunResult = target || args.port !== undefined || discovered.length === 0
+			? await runThroughExtension(target?.port ?? port, { cwd: args.workspace ?? cwd, via: args.via, filters: args.filters }, live, cancel, target?.instanceId)
+			: { kind: 'not-listening' };
 		if (result.kind === 'done') {
 			summary = result.summary;
 		} else if (result.kind === 'cancelled') {
@@ -576,7 +589,7 @@ async function main(): Promise<number> {
 			live(`[lunit] could not run through the VS Code extension: ${result.message}\n`);
 			return 2;
 		} else {
-			live(`[lunit] no VS Code window with the Lunit extension is listening on port ${port}; running standalone from ${workspaceRoot}.\n`);
+			live(`[lunit] no matching VS Code window found; running standalone from ${workspaceRoot}.\n`);
 		}
 	}
 
