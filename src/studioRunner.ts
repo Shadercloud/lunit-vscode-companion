@@ -355,7 +355,7 @@ async function runViaLiveSync(
 			token,
 		);
 		onOutput(output + '\n');
-		const anyFailed = parseResultLines(output).some((r) => r.status === 'failed');
+		const anyFailed = output.includes('[lunit] ERROR:') || parseResultLines(output).some((r) => r.status === 'failed');
 		return { code: anyFailed ? 1 : 0, output, timedOut: false, cancelled: false };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);

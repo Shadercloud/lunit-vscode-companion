@@ -47,7 +47,7 @@ export class LiveSyncBridge {
 
 	private server: http.Server | undefined;
 	private lastPluginSeenAt = 0;
-	private currentJob: { id: string; code: string; resolve: (output: string) => void } | undefined;
+	private currentJob: { id: string; code: string; delivered: boolean; resolve: (output: string) => void } | undefined;
 	private jobCounter = 0;
 
 	constructor(
@@ -72,7 +72,7 @@ export class LiveSyncBridge {
 
 	/** True once the plugin has polled recently enough to be considered live right now. */
 	get isPluginConnected(): boolean {
-		return this.server !== undefined && Date.now() - this.lastPluginSeenAt < 5000;
+		return this.server !== undefined && (this.currentJob?.delivered === true || Date.now() - this.lastPluginSeenAt < 5000);
 	}
 
 	/**
@@ -82,15 +82,27 @@ export class LiveSyncBridge {
 	 * runs one job per poll cycle anyway).
 	 */
 	runJob(code: string, timeoutMs: number, cancelSignal?: CancelSignal): Promise<string> {
+		if (cancelSignal?.isCancellationRequested) {
+			return Promise.reject(new Error('cancelled'));
+		}
 		if (this.currentJob) {
-			return Promise.reject(new Error('a live-sync test run is already in progress'));
+			return Promise.reject(new Error('a live-sync test run is still executing or awaiting cleanup acknowledgement in Studio'));
 		}
 		return new Promise<string>((resolve, reject) => {
 			const id = `job-${++this.jobCounter}-${Date.now()}`;
 
-			const settle = (fn: () => void) => {
-				if (this.currentJob?.id === id) {
+			let settled = false;
+			let cancelSub: { dispose(): void } | undefined;
+			const settle = (fn: () => void, drain = false) => {
+				if (settled) { return; }
+				settled = true;
+				if (this.currentJob?.id === id && !(drain && this.currentJob.delivered)) {
 					this.currentJob = undefined;
+				}
+				if (drain && this.currentJob?.id === id) {
+					// Keep only the acknowledgement lock after the caller has left.
+					this.currentJob.code = '';
+					this.currentJob.resolve = () => {};
 				}
 				cancelSub?.dispose();
 				clearTimeout(timeoutHandle);
@@ -101,21 +113,24 @@ export class LiveSyncBridge {
 				settle(() =>
 					reject(
 						new Error(
-							`timed out after ${Math.round(timeoutMs / 1000)}s waiting for the Roblox Studio plugin to run the tests and report back -- is it still installed and enabled?`,
+							`timed out after ${Math.round(timeoutMs / 1000)}s waiting for the Roblox Studio plugin to run the tests and report back; delivered jobs retain the run lock until Studio finishes and acknowledges cleanup`,
 						),
 					),
+					true,
 				);
 			}, timeoutMs);
-
-			const cancelSub = cancelSignal?.onCancellationRequested(() => {
-				settle(() => reject(new Error('cancelled')));
-			});
 
 			this.currentJob = {
 				id,
 				code,
+				delivered: false,
 				resolve: (output) => settle(() => resolve(output)),
 			};
+			cancelSub = cancelSignal?.onCancellationRequested(() => {
+				settle(() => reject(new Error('cancelled')), true);
+			});
+			if (settled) { cancelSub?.dispose(); }
+
 		});
 	}
 
@@ -123,11 +138,14 @@ export class LiveSyncBridge {
 		if (req.method === 'GET' && req.url === '/poll') {
 			this.lastPluginSeenAt = Date.now();
 			res.setHeader('Content-Type', 'application/json');
-			res.end(
-				this.currentJob
-					? JSON.stringify({ jobId: this.currentJob.id, code: this.currentJob.code })
-					: JSON.stringify({ jobId: null }),
-			);
+			const job = this.currentJob;
+			if (job && !job.delivered) {
+				job.delivered = true;
+				res.end(JSON.stringify({ jobId: job.id, code: job.code }));
+				job.code = '';
+			} else {
+				res.end(JSON.stringify({ jobId: null }));
+			}
 			return;
 		}
 

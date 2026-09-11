@@ -69,14 +69,22 @@ toggleButton.Click:Connect(function()
 	toggleButton:SetActive(running)
 end)
 
+local alive = true
+local activeOwner = nil
+local activeThread = nil
+
 local function runJob(code: string): string
 	local fn, compileErr = loadstring(code)
 	if not fn then
-		return "[lunit] failed to compile job: " .. tostring(compileErr)
+		return "[lunit] ERROR: failed to compile job: " .. tostring(compileErr)
 	end
-	local ok, result = pcall(fn)
+	local owner = {}
+	activeOwner = owner
+	local ok, result = pcall(fn, owner)
+	if owner.cleanup then pcall(owner.cleanup) end
+	activeOwner = nil
 	if not ok then
-		return "[lunit] job errored: " .. tostring(result)
+		return "[lunit] ERROR: job errored: " .. tostring(result)
 	end
 	return tostring(result)
 end
@@ -101,22 +109,30 @@ local function poll()
 
 	local output = runJob(body.code)
 
-	pcall(function()
-		HttpService:RequestAsync({
-			Url = BASE_URL .. "/result",
-			Method = "POST",
-			Headers = { ["Content-Type"] = "application/json" },
-			Body = HttpService:JSONEncode({ jobId = body.jobId, output = output }),
-		})
-	end)
+	-- A result acknowledges cleanup. Retry delivery before accepting another
+	-- job, so a transient HTTP failure cannot strand the extension's run lock.
+	while alive do
+		local sent, response = pcall(function()
+			return HttpService:RequestAsync({
+				Url = BASE_URL .. "/result",
+				Method = "POST",
+				Headers = { ["Content-Type"] = "application/json" },
+				Body = HttpService:JSONEncode({ jobId = body.jobId, output = output }),
+			})
+		end)
+		if sent and response.Success then break end
+		task.wait(POLL_INTERVAL_SECONDS)
+	end
 end
 
-local alive = true
 plugin.Unloading:Connect(function()
 	alive = false
+	if activeThread then pcall(task.cancel, activeThread) end
+	if activeOwner and activeOwner.cleanup then pcall(activeOwner.cleanup) end
+	activeOwner = nil
 end)
 
-task.spawn(function()
+activeThread = task.defer(function()
 	while alive do
 		if running then
 			poll()

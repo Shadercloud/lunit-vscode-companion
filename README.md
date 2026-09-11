@@ -309,3 +309,14 @@ attempt wins."
 
 See `lunit.*` and `lunit.studio.*` in Settings (search "Lunit") — every command and path is configurable,
 including `${workspaceFolder}` / `${outDir}` / `${placeFile}` token substitution in command strings.
+
+For live-sync module isolation, supported layouts, bridge upgrades and validation, see [Studio live-sync isolation](docs/live-sync.md).
+
+### F5 debugging
+
+This repository disables `debug.javascript.enableNetworkView` in
+`.vscode/settings.json`. On VS Code 1.137.0, enabling that debugger feature
+reproduced an extension-host startup crash (exit code 134), before Lunit
+activation. With it disabled, an F5 smoke test activated v0.3.1 and opened a
+`.test.tsx` file successfully. This affects the debugger's Network view only;
+normal debugging and Lunit's HTTP live-sync bridge remain enabled.

@@ -1,0 +1,5 @@
+{
+	// VS Code 1.137's debugger Network view can abort the extension host
+	// during F5 startup (exit 134). Keep ordinary debugging enabled.
+	"debug.javascript.enableNetworkView": false
+}

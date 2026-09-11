@@ -112,7 +112,7 @@ async function installPluginInteractive(): Promise<void> {
 		return;
 	}
 	vscode.window.showInformationMessage(
-		`Lunit: installed the Roblox Studio live-sync plugin to ${result.installedPath}. Restart Studio (or reopen it) to load it -- once loaded, it polls automatically, no further setup needed.`,
+		`Lunit: installed the Roblox Studio live-sync plugin to ${result.installedPath}. To activate the update without closing Studio, enable Plugin Debugging Enabled in Studio settings, replace the LunitStudioBridge script in PluginDebugService with this file, then right-click its plugin and choose Save and Reload Plugin. Writing the file alone does not update an already-loaded bridge.`,
 	);
 }
 
