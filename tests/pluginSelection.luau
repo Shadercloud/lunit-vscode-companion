@@ -14,6 +14,8 @@ local objects = {}
 local discoveryDelay = 0.15
 local noWorkspaces = false
 local widget
+local panelIds = {}
+local panelOrder = {}
 local savedSettings = {}
 local scenario = process.args[2]
 if scenario == 'remembered-workspace' then
@@ -48,10 +50,22 @@ local plugin = {
  CreatePluginAction = function() error('picker must not use PluginAction') end,
  CreatePluginMenu = function() error('picker must not use popup menus') end,
  CreateDockWidgetPluginGuiAsync = function(_, id)
-  assert(id == 'LunitWorkspacePanel')
-  widget = newObject('DockWidgetPluginGui')
-  widget.Enabled = false
-  return widget
+  assert(id:sub(1, 20) == 'LunitWorkspacePanel_', 'panel layout id must be window specific: ' .. id)
+  assert(not panelIds[id], 'panel layout ids must not be reused: ' .. id)
+  panelIds[id] = true
+  table.insert(panelOrder, id)
+  local panel = newObject('DockWidgetPluginGui')
+  panel.Enabled = false
+  if scenario == 'panel-layout-owned' and #panelOrder == 1 then
+   -- Studio ignores Enabled when another open Studio window owns this layout.
+   widget = setmetatable({}, {__index = panel, __newindex = function(_, key, value)
+    if key == 'Enabled' and value == true then return end
+    panel[key] = value
+   end})
+   return widget
+  end
+  widget = panel
+  return panel
  end,
  Unloading = {Connect = function(_, callback) unloading = callback end},
  CreateToolbar = function()
@@ -97,7 +111,7 @@ end
 local environment = {
  Instance = {new = newObject}, Enum = roblox.Enum, Color3 = roblox.Color3, UDim2 = roblox.UDim2, UDim = roblox.UDim,
  DockWidgetPluginGuiInfo = {new = function(...) return {...} end},
- game = {GetService = function() return http end},
+ game = {GetService = function() return http end, PlaceId = 0, Name = 'Test Place'},
  plugin = plugin, task = task, print = function() end, warn = function(message) table.insert(warnings, message) end,
  loadstring = function(code) return luau.load(code) end,
 }
@@ -114,6 +128,15 @@ if scenario == 'remembered-workspace' or scenario == 'remembered-unavailable' th
  assert(#calls > 20, 'restored selection must poll')
  unloading()
  print('Remembered workspace startup regression checks passed: ' .. scenario)
+ process.exit(0)
+end
+if scenario == 'panel-layout-owned' then
+ buttons.LunitOpenConnection.click()
+ assert(#panelOrder == 2, 'a window that cannot show its panel must claim its own layout')
+ assert(widget.Enabled, 'the replacement panel must open')
+ assert(find('LunitPanel').Parent == widget, 'panel contents must move to the replacement widget')
+ unloading()
+ print('Panel layout contention regression checks passed')
  process.exit(0)
 end
 if process.args[2] == 'slow-unused-ports' then

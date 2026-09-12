@@ -1,8 +1,9 @@
 # Studio live-sync isolation
 
 Each job takes one detached snapshot of the place's ModuleScripts and their
-Folder ancestry, then maps original test candidates into it. Nothing is parented
-to the DataModel, and no Script or LocalScript is copied or activated. Discovery
+container ancestry, then maps original test candidates into it. Nothing is
+parented to the DataModel, and no Script or LocalScript is copied or activated --
+one standing in a module's ancestry becomes a plain same-named Folder. Discovery
 still scans original place descendants for `.test`/`.spec`, excluding immediate
 children of `forks`. Plugin and PluginDebugService descendants are excluded. This preserves existing discovery scope, including nested
 packages; it does not establish which VS Code workspace owns the open place.
@@ -32,10 +33,24 @@ No consumer RuntimeLib or test files are rewritten.
 
 - Exactly one discovered RuntimeLib and one `@rbxts/lunit` are supported. Multiple
   independent runtimes/framework copies fail with an explicit diagnostic.
-- Module ancestors must be Folders, ModuleScripts, or direct DataModel children
-  representing service roots. A module under a Model/Script or another instance
-  class fails setup explicitly. The scan currently includes all place modules,
-  so an unrelated unsupported module tree also prevents the run.
+- Module ancestors must be Folders, ModuleScripts, Scripts/LocalScripts, direct
+  DataModel children representing service roots, or the nested engine containers
+  `StarterPlayerScripts` and `StarterCharacterScripts` (where roblox-ts game
+  projects keep client code). Every one of these except a ModuleScript is
+  snapshotted as a same-named Folder -- a Script holding helper modules is
+  ordinary Roblox, and a Folder stand-in preserves the hierarchy require-by-path
+  needs without copying or activating the Script itself. Require-by-path and
+  absolute `game:GetService(...)` paths both resolve into the snapshot.
+- A module under any other ancestor (a Model, a Tool, an arbitrary instance
+  class) is left out of the snapshot rather than failing the run: the scan covers
+  every module in the place, so an unrelated tree must not be able to abort a run
+  that never needed it. Those modules are reported once as a capped warning
+  (`N module(s) skipped (unsupported ancestor): ...`). Being skipped is only ever
+  a warning while nothing needs the module -- a test that sits under such an
+  ancestor is reported as that test failing to load, an import of a skipped module
+  fails with the explicit diagnostic and the dependency chain that reached it, and
+  a skipped RuntimeLib or `@rbxts/lunit` still fails the whole run. Skipping never
+  turns into a silently missing test.
 - The snapshot contains module source, names, attributes and Folder structure;
   it is not a cloned world. Tests reading assets through `script` ancestry,
   relying on service class identity in that ancestry, or expecting the cloned

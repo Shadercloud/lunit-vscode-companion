@@ -106,6 +106,7 @@ environment.loadstring = function(source, name)
  local ok, result = pcall(luau.load, source, {debugName = name, environment = environment, injectGlobals = true})
  return ok and result or nil, not ok and result or nil
 end
+local expectedTests = 100
 local function run(expectError)
  local originalCount = #game:GetDescendants()
  local owner = {}
@@ -127,7 +128,7 @@ local function run(expectError)
  assert((output:find('[lunit] ERROR:', 1, true) ~= nil) == expectError, output)
  local count = 0
  for _ in output:gmatch('@@LUNIT_RESULT@@') do count += 1 end
- if not expectError then assert(count == 100, 'wrong test count: '..count) end
+ if not expectError then assert(count == expectedTests, 'wrong test count: '..count) end
  for line in output:gmatch('[^\n]+') do
   if line:find('live%-sync') then print(line) end
  end
@@ -165,8 +166,68 @@ types.Source = 'return'
 assert(run(true):find('ModuleScript must return exactly one value; got 0', 1, true))
 types.Source = 'return nil, 2'
 assert(run(true):find('ModuleScript must return exactly one value; got 2', 1, true))
-local model = node('Model' , 'unsupported', rs)
+-- Restore the modules earlier failure cases deliberately broke.
+types.Source = [[
+_G.typeLoads = (_G.typeLoads or 0) + 1
+return nil
+]]
+tests[1].Source = testSource:gsub('INDEX', '1'):gsub('VERSION', '2')
+-- roblox-ts game projects keep client code, and so client tests, under
+-- StarterPlayer.StarterPlayerScripts rather than under a Folder or a service.
+local starterPlayer = node('StarterPlayer', 'StarterPlayer', game)
+local clientScripts = node('StarterPlayerScripts', 'StarterPlayerScripts', starterPlayer)
+local characterScripts = node('StarterCharacterScripts', 'StarterCharacterScripts', starterPlayer)
+node('ModuleScript', 'component', clientScripts, 'return {rendered = true}')
+node('ModuleScript', 'motor', characterScripts, 'return {speed = 16}')
+node('ModuleScript', 'client.test', clientScripts, [[
+local TS = require(game.ReplicatedStorage.RuntimeLib)
+-- Absolute service paths yield real Instances; they must map into the snapshot.
+local component = TS.import(script, game.StarterPlayer.StarterPlayerScripts.component)
+assert(component == require('./component'))
+assert(component == require('@game/StarterPlayer/StarterPlayerScripts/component'))
+assert(component == require(game.StarterPlayer.StarterPlayerScripts.component))
+assert(component.rendered)
+assert(require('@game/StarterPlayer/StarterCharacterScripts/motor').speed == 16)
+return { check = function() end }
+]])
+expectedTests = 101
+run(false)
+-- A ModuleScript parented to a Script is ordinary Roblox, so it is supported
+-- outright: the suite runs and nothing is skipped or warned about.
+local runnerScript = node('Script', 'RunTests', rs)
+node('ModuleScript', 'LunitTags', runnerScript, 'return {tag = true}')
+node('ModuleScript', 'runner.test', runnerScript, [[
+assert(require('./LunitTags').tag)
+assert(require('@game/ReplicatedStorage/RunTests/LunitTags').tag)
+assert(script.Parent.Name == 'RunTests')
+return { check = function() end }
+]])
+expectedTests = 102
+local scriptAncestor = run(false)
+assert(not scriptAncestor:find('skipped', 1, true), scriptAncestor)
+-- An unrelated module under a genuinely unsupported ancestor is left out of the
+-- snapshot with one warning, rather than aborting a run that never needed it.
+local model = node('Model', 'unsupported', rs)
 node('ModuleScript', 'nested', model, 'return {}')
-assert(run(true):find('unsupported module ancestor', 1, true))
+local skipWarning = run(false)
+assert(skipWarning:find('1 module(s) skipped (unsupported ancestor)', 1, true), skipWarning)
+assert(skipWarning:find('ReplicatedStorage.unsupported.nested', 1, true), skipWarning)
 model:Destroy()
+-- A test whose own ancestor is unsupported is reported as that test failing to
+-- load, never quietly dropped from the results.
+local world = node('Model', 'world', rs)
+node('ModuleScript', 'orphan.test', world, 'return { check = function() end }')
+local orphan = run(true)
+assert(orphan:find('failed to load test module', 1, true), orphan)
+assert(orphan:find('orphan.test', 1, true), orphan)
+assert(orphan:find('unsupported module ancestor', 1, true), orphan)
+world:Destroy()
+-- A test that imports a skipped module fails with the chain that reached it.
+local hidden = node('Model', 'hidden', rs)
+node('ModuleScript', 'buried', hidden, 'return {}')
+tests[1].Source = 'return { dep = require(game.ReplicatedStorage.hidden.buried), check = function() end }'
+local chain = run(true)
+assert(chain:find('1.test:', 1, true), chain)
+assert(chain:find('is outside the snapshot', 1, true), chain)
+assert(chain:find('unsupported module ancestor', 1, true), chain)
 print('Luau repeated-run regression checks passed')

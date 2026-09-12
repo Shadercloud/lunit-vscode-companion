@@ -2,3 +2,9 @@ out/
 node_modules/
 *.vsix
 .vscode-test/
+
+# The game-project test fixture deliberately commits an out/ and a node_modules/:
+# they are its compiled roblox-ts output and its stand-in @rbxts/lunit, which the
+# Lune game-project regression test builds a DataModel from.
+!tests/fixtures/**/out/
+!tests/fixtures/**/node_modules/

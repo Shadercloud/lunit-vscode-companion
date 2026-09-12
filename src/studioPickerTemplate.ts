@@ -3,10 +3,32 @@ import { BRIDGE_PORT_COUNT } from './liveSyncBridge';
 /** Shares the plugin's selected/busy/alive state; does not use PluginAction APIs. */
 export function buildStudioPickerScript(): string {
 	return `
-local widget = plugin:CreateDockWidgetPluginGuiAsync("LunitWorkspacePanel", DockWidgetPluginGuiInfo.new(
-	Enum.InitialDockState.Float, false, true, 480, 340, 320, 240
-))
-widget.Title = "Lunit — Connect to VS Code"
+-- Studio saves each dock widget layout globally, keyed by its pluginGuiId, and
+-- every open Studio window shares that one saved entry. When several windows
+-- use the same id, only the window owning the saved layout can show the panel;
+-- the others silently ignore Enabled. Key the id by place so windows editing
+-- different places never contend, and claim a fresh id when a window still
+-- cannot show its panel (see showPanel).
+local PANEL_TITLE = "Lunit — Connect to VS Code"
+local PANEL_INFO = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, true, 480, 340, 320, 240)
+local function placeKey()
+	local ok, key = pcall(function()
+		local placeId = game.PlaceId
+		if type(placeId) == "number" and placeId ~= 0 then return tostring(placeId) end
+		return (string.gsub(tostring(game.Name), "[^%w]", "_"))
+	end)
+	if not ok or type(key) ~= "string" or key == "" then return "Unsaved" end
+	return key
+end
+local panelId = "LunitWorkspacePanel_" .. placeKey()
+local panels = {}
+local widget = plugin:CreateDockWidgetPluginGuiAsync(panelId, PANEL_INFO)
+table.insert(panels, widget)
+widget.Title = PANEL_TITLE
+local function destroyPanels()
+	for _, panel in panels do pcall(function() panel:Destroy() end) end
+	panels = {}
+end
 
 local function ui(className, name, properties, parent)
 	local object = Instance.new(className)
@@ -199,9 +221,30 @@ local function refreshWorkspaces()
 	end)
 end
 refreshButton.Activated:Connect(refreshWorkspaces)
+local function showPanel()
+	-- Re-assert rather than assume: a panel that is already Enabled but hidden,
+	-- because another Studio window owns its saved layout, stays invisible
+	-- unless it is toggled.
+	widget.Enabled = false
+	widget.Enabled = true
+	if widget.Enabled then return end
+	-- Studio refused this layout, so give this window a layout of its own.
+	local freshId = string.format("%s_%d_%d", panelId, os.time(), math.random(1, 999999))
+	local created, replacement = pcall(function() return plugin:CreateDockWidgetPluginGuiAsync(freshId, PANEL_INFO) end)
+	if not created or not replacement then
+		warn("[lunit] Could not open the Lunit panel in this Studio window: " .. tostring(replacement))
+		return
+	end
+	replacement.Title = PANEL_TITLE
+	table.insert(panels, replacement)
+	root.Parent = replacement
+	widget = replacement
+	widget.Enabled = true
+	print("[lunit] Opened the Lunit panel with a layout specific to this Studio window.")
+end
 selectButton.Click:Connect(function()
 	-- Show the panel before starting any network request, including during a run.
-	widget.Enabled = true
+	showPanel()
 	refreshWorkspaces()
 end)
 -- Discover once on plugin startup without opening the window.

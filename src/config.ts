@@ -39,6 +39,12 @@ export interface LunitConfig {
 		executable: string;
 		testsRoot: string;
 		lunitRoot: string;
+		/**
+		 * Rojo project file describing the DataModel for a roblox-ts game
+		 * project. Empty means "work it out from the compiled output" --
+		 * see luneProjectKind.ts.
+		 */
+		projectFile: string;
 	};
 	studio: {
 		enabled: boolean;
@@ -98,6 +104,7 @@ export function buildConfig(root: string, storageDir: string, get: SettingReader
 			executable: get<string>('lune.executable', 'lune'),
 			testsRoot: resolveTokens(get<string>('testsRoot', '${workspaceFolder}'), baseTokens),
 			lunitRoot: resolveTokens(get<string>('lunitRoot', '${workspaceFolder}/node_modules/@rbxts/lunit/out'), baseTokens),
+			projectFile: resolveTokens(get<string>('lune.projectFile', ''), baseTokens),
 		},
 		studio: {
 			enabled: get<boolean>('studio.enabled', true),

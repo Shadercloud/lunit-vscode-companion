@@ -13,6 +13,15 @@ local root = Instance.new("Folder")
 root.Name = "LunitRun"
 owner.root = root
 local copies, sources, cache, loading = {}, {}, {}, {}
+-- Engine containers that hold project code but are neither Folders nor direct
+-- DataModel children. roblox-ts game projects keep all client code (and so all
+-- client tests) under StarterPlayer.StarterPlayerScripts. A same-named Folder
+-- stands in for them so require-by-path still resolves. Deliberately a closed
+-- list: a Model or Script ancestor stays unsupported.
+local NESTED_CONTAINERS = {StarterPlayerScripts = true, StarterCharacterScripts = true}
+-- Modules left out of the snapshot, by original instance, with the reason.
+local skipped, skippedOrder = {}, {}
+local SKIPPED_REPORT_LIMIT = 5
 local globals, sharedGlobals = {}, {}
 local closed = false
 local threads = {}
@@ -33,6 +42,8 @@ local function cleanup()
 	owner.root = nil
 	table.clear(copies)
 	table.clear(sources)
+	table.clear(skipped)
+	table.clear(skippedOrder)
 	table.clear(cache)
 	table.clear(loading)
 	table.clear(globals)
@@ -65,10 +76,15 @@ local function snapshot(instance)
 		copy = Instance.new("ModuleScript")
 		copy.Source = instance.Source
 		sources[copy] = copy.Source
-	elseif instance:IsA("Folder") or parent == game then
+	elseif instance:IsA("Folder") or parent == game or NESTED_CONTAINERS[instance.ClassName]
+		or instance:IsA("LuaSourceContainer") then
+		-- A Script/LocalScript holding helper ModuleScripts is ordinary Roblox.
+		-- The snapshot never copies or activates one, so a same-named Folder
+		-- stand-in preserves the hierarchy require-by-path needs without
+		-- changing execution semantics.
 		copy = Instance.new("Folder")
 	else
-		error("isolation: unsupported module ancestor " .. instance:GetFullName() .. " (" .. instance.ClassName .. "); use Folder/ModuleScript module roots")
+		error("isolation: unsupported module ancestor " .. instance:GetFullName() .. " (" .. instance.ClassName .. "); use Folder/ModuleScript module roots", 0)
 	end
 	copy.Name = instance.Name
 	copies[instance] = copy
@@ -130,7 +146,14 @@ isolatedRequire = function(target)
 	-- Absolute game:GetService paths still return real Instances. Canonicalize
 	-- their module targets here; never fall back to Roblox's session cache.
 	local module = copies[target] or target
-	if sources[module] == nil then error("isolation: import outside snapshot: " .. target:GetFullName()) end
+	if sources[module] == nil then
+		-- A module the pre-pass had to leave out is only an error once something
+		-- actually imports it -- report it here, against the importer, with the
+		-- reason it was skipped.
+		local reason = skipped[target]
+		if reason ~= nil then error("isolation: " .. target:GetFullName() .. " is outside the snapshot: " .. reason, 0) end
+		error("isolation: import outside snapshot: " .. target:GetFullName())
+	end
 	while loading[module] do
 		if loading[module] == coroutine.running() then error("isolation: circular require: " .. module:GetFullName()) end
 		task.wait()
@@ -198,12 +221,33 @@ local ok, failure = xpcall(function()
 		error("isolation: expected exactly one RuntimeLib and @rbxts/lunit; found " .. #runtimes .. " and " .. #frameworks .. "; multiple runtime/package layouts are unsupported")
 	end
 	if #tests == 0 then error("no *.test / *.spec ModuleScripts found anywhere in this place") end
+	-- Snapshotting every module in the place is what makes an unrelated tree
+	-- able to break a run, so a failure here only takes that module out of the
+	-- snapshot. Anything the run actually needs still fails hard below, where
+	-- the recorded reason is reported against whatever asked for it.
 	for _, instance in originals do
-		if instance:IsA("ModuleScript") then snapshot(instance) end
+		if instance:IsA("ModuleScript") then
+			local snapshotOk, failure = pcall(snapshot, instance)
+			if not snapshotOk then
+				skipped[instance] = tostring(failure)
+				table.insert(skippedOrder, instance)
+			end
+		end
 	end
 	-- Include empty folders used by package lookup, without Scripts or world assets.
 	for _, instance in originals do
 		if instance:IsA("Folder") and copies[instance.Parent] then snapshot(instance) end
+	end
+	if #skippedOrder > 0 then
+		-- One capped line, not one per module: a large place can carry many.
+		local names = {}
+		for index = 1, math.min(#skippedOrder, SKIPPED_REPORT_LIMIT) do
+			table.insert(names, skippedOrder[index]:GetFullName())
+		end
+		local remaining = #skippedOrder - #names
+		log("WARNING: " .. #skippedOrder .. " module(s) skipped (unsupported ancestor): "
+			.. table.concat(names, ", ") .. (remaining > 0 and (", and " .. remaining .. " more") or "")
+			.. ". They are left out of the snapshot; a test that needs one fails explicitly.")
 	end
 	log(string.format("live-sync setup %.2f ms (%d tests)", (os.clock() - started) * 1000, #tests))
 	local loadStart = os.clock()
@@ -215,11 +259,26 @@ local ok, failure = xpcall(function()
 		return import(copies[context] or context, copies[target] or target, ...)
 	end
 	local framework = frameworks[1]:FindFirstChild("out") or frameworks[1]
+	-- The runtime and the framework are needed by every test, so a skip here is
+	-- fatal rather than a warning.
+	for _, required in { runtimes[1], framework } do
+		if copies[required] == nil then
+			error("isolation: " .. required:GetFullName() .. " could not be snapshotted: "
+				.. tostring(skipped[required] or "it is outside the snapshot"))
+		end
+	end
 	local lunit = runtime.import(copies[runtimes[1]], copies[framework])
 	loadSeconds += os.clock() - loadStart
 	for _, original in tests do
 		loadStart = os.clock()
-		local loaded, cls = pcall(runtime.import, copies[runtimes[1]], copies[original])
+		-- A test under an unsupported ancestor is reported as that test failing
+		-- to load, never quietly dropped from the results.
+		local loaded, cls
+		if copies[original] == nil then
+			loaded, cls = false, tostring(skipped[original] or "isolation: module is outside the snapshot")
+		else
+			loaded, cls = pcall(runtime.import, copies[runtimes[1]], copies[original])
+		end
 		loadSeconds += os.clock() - loadStart
 		if not loaded then
 			log("ERROR: failed to load test module " .. original:GetFullName() .. ": " .. tostring(cls))

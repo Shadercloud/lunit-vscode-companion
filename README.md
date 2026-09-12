@@ -135,7 +135,41 @@ Lunit's own upstream source and its real compiled self-test suite, not guessed f
 
 ### Lune profile
 
-Works out of the box if `npx rbxtsc` and Lune resolve in your project. Defaults to `testsRoot = ${workspaceFolder}`
+The profile handles both roblox-ts project types, and works out which one you have by reading your compiled
+output -- there's normally nothing to configure.
+
+**Package projects** (`--type package`) compile to entirely `script`-relative code (each module opens with
+`_G[script]`), so the runner discovers `*.test.luau` / `*.spec.luau` on disk and requires them by path. This
+is the long-standing behaviour, described in the rest of this section.
+
+**Game projects** (`--type game`) can't be run that way: because a Rojo project file decides that (say)
+`src/game/shared` becomes `ReplicatedStorage.Game`, roblox-ts emits *absolute DataModel paths*, and every
+import in every module resolves by walking the DataModel:
+
+```lua
+local TS = require(game:GetService("ReplicatedStorage"):WaitForChild("rbxts_include"):WaitForChild("RuntimeLib"))
+local _lunit = TS.import(script, game:GetService("ReplicatedStorage"), "rbxts_include", "node_modules", "@rbxts", "lunit", "out")
+```
+
+For these, the extension builds a virtual, read-only DataModel from the same Rojo project file Studio syncs,
+loads your project's own `RuntimeLib` on top of it, and discovers tests by walking that tree. Roblox
+datatypes (`Vector3`, `CFrame`, `Color3`, `UDim2`, `Enum`, ...) come from Lune's own implementations, so they
+behave as the engine's do -- float32 `Vector3` components, `typeof(CFrame.new()) == "CFrame"`, working
+operators. `require`-by-string (`./`, `../`, `@self/`) resolves against the calling module's position in the
+tree.
+
+There is deliberately **no engine**: no `Instance.new`, no real services, no scheduler or clocks. A service
+your project never mapped resolves to an empty stub so that a module merely referencing one at load time
+still loads, but a test that actually needs the engine belongs in the Studio profile behind `@Tag("Studio")`
+-- a class-level `@Tag("Studio")` module is never even loaded, so it's free to touch the engine at load time.
+A module that fails to load fails the run and names the dependency chain that reached the failure.
+
+The Rojo project is picked automatically when there's only one candidate at the workspace root (or a
+`default.project.json`). If several could describe your tests the run stops and asks, because only you know
+which one builds them: set **`lunit.lune.projectFile`** to it. Setting it also forces the game path
+explicitly. Package projects ignore this setting entirely and need no new configuration.
+
+The rest of this section applies to package projects. Defaults are `testsRoot = ${workspaceFolder}`
 (the whole workspace, walked recursively for `*.test.luau` / `*.spec.luau` and skipping `node_modules` -- so
 nested packages with their own independent `tsconfig.json`/`outDir` are found too, not just a single
 top-level `out/`) and `lunitRoot = node_modules/@rbxts/lunit/out` — a published `@rbxts` package normally

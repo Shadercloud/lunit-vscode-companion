@@ -120,7 +120,7 @@ end
 plugin.Unloading:Connect(function()
 	alive = false
 	cancelDiscovery()
-	widget:Destroy()
+	destroyPanels()
 	if activeThread then pcall(task.cancel, activeThread) end
 	if activeOwner and activeOwner.cleanup then pcall(activeOwner.cleanup) end
 	activeOwner = nil
