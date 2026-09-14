@@ -1,4 +1,5 @@
 import { buildLuauEmitHelpers } from './luauEmitHelpers';
+import { buildLuauTestFilterHelpers } from './luauTestFilterTemplate';
 
 /**
  * Builds the Lune entry script used for roblox-ts `--type game` projects.
@@ -54,59 +55,13 @@ local function fail(text)
 end
 
 --------------------------------------------------------------------------------
--- Tag rules
---
--- Lunit's own 'tags' run option can only *include* tags, never exclude them,
--- so tests that must not run here are removed from the class before it runs
--- and reported as left out. (Marking them disabled instead makes Lunit's own
--- summary file them under "Failures", which they are not.)
+-- Tag rules: tests tagged "Studio" are left out and reported as such. See
+-- luauTestFilterTemplate.ts.
 --------------------------------------------------------------------------------
 
-local EXCLUDED_TAG = "Studio"
+` + buildLuauTestFilterHelpers('Studio') + String.raw`
 
-local function hasTag(tags, tag)
-	return tags ~= nil and table.find(tags, tag) ~= nil
-end
-
--- True when the whole class is tagged to be left out of this runtime.
-local function isClassExcluded(cls)
-	local metadata = cls["lunit:class"]
-	return metadata ~= nil and hasTag(metadata.tags, EXCLUDED_TAG)
-end
-
--- Removes every excluded test method; returns how many were removed.
-local function removeExcludedMethods(cls)
-	local methods = cls["lunit:method:test"]
-	if methods == nil then return 0 end
-	local removed = 0
-	for name, method in methods do
-		if method.options.isTest and hasTag(method.options.tags, EXCLUDED_TAG) then
-			methods[name] = nil
-			removed += 1
-		end
-	end
-	return removed
-end
-
-local function countTests(cls)
-	local count = 0
-	for _, method in cls["lunit:method:test"] or {} do
-		if method.options.isTest then count += 1 end
-	end
-	return count
-end
-
--- True when compiled Luau declares its test class with a class-level @Tag.
--- roblox-ts compiles @Tag("Studio") class X {} to X = Tag("Studio")(X) or X.
--- Matching the source lets us skip loading a module that needs the engine.
-local function sourceHasClassTag(source)
-	for className in source:gmatch('Tag%(%s*"' .. EXCLUDED_TAG .. '"%s*%)%(%s*([%w_]+)%s*%)') do
-		if source:find(className .. '%s*=%s*Tag%(%s*"' .. EXCLUDED_TAG .. '"%s*%)%(%s*' .. className .. '%s*%)%s*or%s*' .. className) then
-			return true
-		end
-	end
-	return false
-end
+local EXCLUDED_TAG = LUNIT_EXCLUDED_TAG
 
 --------------------------------------------------------------------------------
 -- DataModel, runtime and discovery
@@ -210,7 +165,7 @@ local skippedTests = 0
 for _, module in modules do
 	local fullName = module:GetFullName()
 	local source = fs.readFile(dataModel.sourcePath(module))
-	if sourceHasClassTag(source) then
+	if lunitSourceHasClassTag(source) then
 		-- Never even loaded: such a module may touch the engine at load time.
 		skippedClasses += 1
 	else
@@ -221,11 +176,13 @@ for _, module in modules do
 		elseif type(cls) ~= "table" then
 			loadFailures += 1
 			fail(fullName .. " must 'export =' its test class")
-		elseif isClassExcluded(cls) then
-			skippedClasses += 1
 		else
-			skippedTests += removeExcludedMethods(cls)
-			if countTests(cls) > 0 then
+			local run, classLeftOut, testsLeftOut = lunitFilterClass(cls, tostring(cls))
+			if classLeftOut then
+				skippedClasses += 1
+			end
+			skippedTests += testsLeftOut
+			if run and lunitCountTests(cls) > 0 then
 				table.insert(classes, { cls = cls, fullName = fullName })
 			end
 		end

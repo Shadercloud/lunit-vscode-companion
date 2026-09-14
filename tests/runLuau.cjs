@@ -21,6 +21,7 @@ try {
  }
  if (process.exitCode === 0) {
   require('./luneGame.cjs')(dir);
+  require('./studioTags.cjs')(dir);
  }
 } finally {
  fs.rmSync(dir, {recursive: true, force: true});

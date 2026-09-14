@@ -6,6 +6,7 @@ import { DEFAULT_LIVE_SYNC_PORT } from './config';
 import { getConfig } from './vscodeConfig';
 import { DiscoveredClass, parseTestFile } from './discovery';
 import { CliRunRequest, LiveSyncBridge } from './liveSyncBridge';
+import { buildTestSelection } from './luauTestFilterTemplate';
 import { RunOutcome, runViaLune } from './luneRunner';
 import { createResultLineFilter, parseResultLines, ResultRecord } from './resultProtocol';
 import { isRojoServeRunning } from './rojoDetect';
@@ -741,19 +742,26 @@ async function executeRun(
 	// out of a Lune run rather than just out of its dropdown.
 	const requiredTag = via === 'lune' ? LUNE_TAG : STUDIO_TAG;
 	const leaves: vscode.TestItem[] = [];
+	const leftOut: vscode.TestItem[] = [];
 	for (const root of roots) {
 		const candidates: vscode.TestItem[] = [];
 		collectLeaves(root, candidates);
 		for (const candidate of candidates) {
-			if (!excluded.has(candidate.id) && candidate.tags.some((t) => t.id === requiredTag.id)) {
-				leaves.push(candidate);
+			if (excluded.has(candidate.id)) {
+				continue;
 			}
+			(candidate.tags.some((t) => t.id === requiredTag.id) ? leaves : leftOut).push(candidate);
 		}
 	}
 
+	// Tests this profile's tag rule leaves out (e.g. @Tag("Lune") under Studio)
+	// are reported as skipped, never as failed or errored. The runners leave
+	// them out on their side too (luauTestFilterTemplate.ts).
+	const leftOutResults = applyVerdicts(run, leftOut, () => ({ status: 'skipped' }));
+
 	if (leaves.length === 0) {
 		run.end();
-		return buildSummary(via, [], false, 'no tests to run.');
+		return buildSummary(via, leftOutResults, false, 'no tests to run.');
 	}
 
 	const folder =
@@ -780,12 +788,18 @@ async function executeRun(
 	});
 	const chunkSink = (chunk: string) => displayFilter.feed(chunk);
 
+	// A whole-tree run lets the Studio side run everything its tag rule allows;
+	// an explicit selection is narrowed to exactly the requested tests there.
+	const selection = request.include
+		? buildTestSelection(leaves.map(identityOf).filter((identity): identity is TestIdentity => identity !== undefined))
+		: undefined;
+
 	let outcome: RunOutcome;
 	try {
 		outcome =
 			via === 'lune'
 				? await runViaLune(config, token, chunkSink)
-				: await runViaStudio(config, token, chunkSink, liveSyncBridge);
+				: await runViaStudio(config, token, chunkSink, liveSyncBridge, selection);
 	} catch (err) {
 		displayFilter.flush();
 		const message = `[lunit] test run failed: ${String(err)}`;
@@ -794,20 +808,20 @@ async function executeRun(
 		onOutput?.(message + '\n');
 		const results = applyVerdicts(run, leaves, () => ({ status: 'errored', message }));
 		run.end();
-		return buildSummary(via, results, false);
+		return buildSummary(via, [...results, ...leftOutResults], false);
 	}
 	displayFilter.flush();
 
 	if (outcome.cancelled) {
 		const results = applyVerdicts(run, leaves, () => ({ status: 'skipped' }));
 		run.end();
-		return buildSummary(via, results, true);
+		return buildSummary(via, [...results, ...leftOutResults], true);
 	}
 
 	const records = parseResultLines(outcome.output);
 	const results = applyVerdicts(run, leaves, (identity) => resolveVerdict(identity, records, outcome));
 	run.end();
-	return buildSummary(via, results, false);
+	return buildSummary(via, [...results, ...leftOutResults], false);
 }
 
 /**

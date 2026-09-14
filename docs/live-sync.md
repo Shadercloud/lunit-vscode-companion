@@ -93,6 +93,14 @@ the isolation guarantee. Resolve the hung work before reloading the extension.
 Do not use non-yielding infinite loops to test cancellation. This change provides
 safe draining, not preemptive cancellation of arbitrary Roblox work.
 
+What the job can do is bound itself between test classes. It checks the elapsed
+time before starting each class. Once `lunit.studio.liveSync.timeoutSeconds` has
+passed (VS Code has stopped waiting by then), it logs an `ERROR: stopped after …`
+line and drains as above. It also yields a frame between classes at least every
+50 ms. A single class that runs too long still holds Studio until that class
+finishes. Tests tagged `@Tag("Lune")` are left out of the job entirely, so
+long Lune-only suites no longer count against this timeout.
+
 Compile and the existing `syncDelaySeconds` delay are unchanged. Fresh snapshots
 contain the source present in Studio at snapshot time; they do not prove Rojo has
 finished syncing. Adjust the existing delay when needed.
@@ -127,6 +135,10 @@ The repository previously had a TypeScript compile script and no test suite.
   state, tests load and runner failures, rejects unsupported imports/layouts,
   verifies background-task cancellation, unchanged original descendants, detached
   tree release and no discovery accumulation. It also compiles the plugin Luau.
+  `tests/studioTags.cjs` runs both the job and the standalone bootstrap against
+  `tests/fixtures/game` in a real `@lune/roblox` DataModel. It checks that
+  class-level and method-level `@Tag("Lune")` tests are left out, for a whole-tree
+  run and for an explicit selection, and that the job stops at its deadline.
 
 Both commands passed on 2026-09-11. The harness uses a small simulated framework;
 it does not validate native Studio loadstring permissions, actual Lunit or React,

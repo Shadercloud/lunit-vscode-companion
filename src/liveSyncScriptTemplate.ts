@@ -1,13 +1,27 @@
 import { buildLuauEmitHelpers } from './luauEmitHelpers';
+import { buildLuauTestFilterHelpers, TestSelection } from './luauTestFilterTemplate';
 
-/** One detached snapshot and one require cache per job. See docs/live-sync.md. */
-export function buildLiveSyncJobScript(): string {
+export interface LiveSyncJobOptions {
+	/** Narrows the run to an explicit Test Explorer request; undefined runs everything. */
+	selection?: TestSelection;
+	/** Stop starting new test classes after this long (the extension's live-sync timeout). */
+	deadlineSeconds?: number;
+}
+
+/**
+ * One detached snapshot and one require cache per job. See docs/live-sync.md.
+ * Tests tagged @Tag("Lune") are left out; see luauTestFilterTemplate.ts.
+ */
+export function buildLiveSyncJobScript(options: LiveSyncJobOptions = {}): string {
+	const deadline = options.deadlineSeconds ?? 30;
 	return `--!strict
 local owner = ...
 if owner == nil then
 	return "[lunit] ERROR: the loaded Studio bridge is outdated. Run Lunit: Install Roblox Studio Live-Sync Plugin in VS Code, then reload LunitStudioBridge in Studio (PluginDebugService > Save and Reload Plugin)."
 end
 ${buildLuauEmitHelpers()}
+${buildLuauTestFilterHelpers('Lune', options.selection)}
+local DEADLINE_SECONDS = ${Number.isFinite(deadline) ? Math.max(0, Math.floor(deadline)) : 30}
 local started = os.clock()
 local root = Instance.new("Folder")
 root.Name = "LunitRun"
@@ -269,25 +283,50 @@ local ok, failure = xpcall(function()
 	end
 	local lunit = runtime.import(copies[runtimes[1]], copies[framework])
 	loadSeconds += os.clock() - loadStart
-	for _, original in tests do
+	local classesLeftOut, testsLeftOut = 0, 0
+	for index, original in tests do
+		-- The extension stops waiting at its live-sync timeout, and nothing can
+		-- cancel this job from outside, so stop starting classes by then too.
+		if os.clock() - started >= DEADLINE_SECONDS then
+			log(string.format("ERROR: stopped after %d s, the live-sync timeout; %d test module(s) not run.",
+				DEADLINE_SECONDS, #tests - index + 1))
+			break
+		end
 		loadStart = os.clock()
 		-- A test under an unsupported ancestor is reported as that test failing
 		-- to load, never quietly dropped from the results.
 		local loaded, cls
-		if copies[original] == nil then
+		local copy = copies[original]
+		if copy ~= nil and lunitSourceHasClassTag(sources[copy]) then
+			-- Class-level @Tag("Lune"): never loaded.
+			classesLeftOut += 1
+			loaded, cls = true, nil
+		elseif copy == nil then
 			loaded, cls = false, tostring(skipped[original] or "isolation: module is outside the snapshot")
 		else
-			loaded, cls = pcall(runtime.import, copies[runtimes[1]], copies[original])
+			loaded, cls = pcall(runtime.import, copies[runtimes[1]], copy)
 		end
 		loadSeconds += os.clock() - loadStart
 		if not loaded then
 			log("ERROR: failed to load test module " .. original:GetFullName() .. ": " .. tostring(cls))
-		elseif cls ~= nil then
-			local executionStart = os.clock()
-			local ran, err = pcall(lunitRunClass, lunit, cls, tostring(cls))
-			executionSeconds += os.clock() - executionStart
-			if not ran then log("ERROR: test runner failed: " .. tostring(err)) end
+		elseif type(cls) == "table" then
+			local className = tostring(cls)
+			local run, classLeftOut, methodsLeftOut = lunitFilterClass(cls, className)
+			if classLeftOut then classesLeftOut += 1 end
+			testsLeftOut += methodsLeftOut
+			if run then
+				local executionStart = os.clock()
+				local ran, err = pcall(lunitRunClass, lunit, cls, className)
+				executionSeconds += os.clock() - executionStart
+				if not ran then log("ERROR: test runner failed: " .. tostring(err)) end
+				-- Host task API: yield to Studio between classes.
+				lunitYieldBetweenClasses()
+			end
 		end
+	end
+	if classesLeftOut > 0 or testsLeftOut > 0 then
+		log("left out " .. classesLeftOut .. " " .. LUNIT_EXCLUDED_TAG .. "-tagged test class(es) and "
+			.. testsLeftOut .. " " .. LUNIT_EXCLUDED_TAG .. "-tagged test(s): run them with the Lune profile.")
 	end
 end, debug.traceback)
 if not ok then log("ERROR: " .. tostring(failure)) end

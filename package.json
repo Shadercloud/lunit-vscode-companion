@@ -2,7 +2,7 @@
   "name": "vscode-lunit-companion",
   "displayName": "Lunit Test Companion",
   "description": "Discover and run @rbxts/lunit tests from VS Code's Test Explorer.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "publisher": "ShaderCloud",
   "author": "ShaderCloud",
   "license": "MIT",
@@ -114,11 +114,11 @@
           "description": "Additional environment variables to set when running the compile/test commands."
         },
         "lunit.lune.projectFile": {
-					"type": "string",
-					"default": "",
-					"description": "Rojo project file describing the DataModel for a roblox-ts game project (--type game), whose compiled output resolves every import through absolute DataModel paths rather than relative ones. Leave empty to detect the project type from the compiled output and pick the Rojo project automatically; set it when several Rojo projects at the workspace root could describe your tests. Ignored for package projects, which keep using lunit.testsRoot / lunit.lunitRoot."
-				},
-				"lunit.lune.executable": {
+          "type": "string",
+          "default": "",
+          "description": "Rojo project file describing the DataModel for a roblox-ts game project (--type game), whose compiled output resolves every import through absolute DataModel paths rather than relative ones. Leave empty to detect the project type from the compiled output and pick the Rojo project automatically; set it when several Rojo projects at the workspace root could describe your tests. Ignored for package projects, which keep using lunit.testsRoot / lunit.lunitRoot."
+        },
+        "lunit.lune.executable": {
           "type": "string",
           "default": "lune",
           "description": "Command used to invoke Lune (e.g. \"lune\", \"npx lune\", or an absolute path), used to run the generated test runner script."

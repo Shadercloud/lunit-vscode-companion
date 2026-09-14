@@ -1,6 +1,6 @@
 {
 	"name": "Lunit Game Fixture",
-	"globIgnorePaths": ["out/shared/ignored.luau"],
+	"globIgnorePaths": ["out/shared/ignored.luau", "out/server/luneOnly.test.luau", "out/server/mixedTags.test.luau"],
 	"tree": {
 		"$className": "DataModel",
 		"ReplicatedStorage": {

@@ -37,6 +37,7 @@ import { buildConfig, DEFAULT_LIVE_SYNC_PORT, LunitConfig, SettingReader } from 
 import { discoverBridges, matchingBridges } from './bridgeDiscovery';
 import { parseTestFile } from './discovery';
 import { CliRunRequest, LiveSyncBridge } from './liveSyncBridge';
+import { buildTestSelection } from './luauTestFilterTemplate';
 import { RunOutcome, runViaLune } from './luneRunner';
 import { createResultLineFilter, parseResultLines } from './resultProtocol';
 import {
@@ -500,7 +501,13 @@ async function runStandalone(
 		outcome =
 			args.via === 'lune'
 				? await runViaLune(config, cancel.token, chunkSink)
-				: await runViaStudio(config, cancel.token, chunkSink, bridge);
+				: await runViaStudio(
+						config,
+						cancel.token,
+						chunkSink,
+						bridge,
+						args.filters.length > 0 ? buildTestSelection(leaves) : undefined,
+					);
 	} catch (err) {
 		displayFilter.flush();
 		const message = `[lunit] test run failed: ${String(err)}`;

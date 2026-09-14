@@ -239,7 +239,9 @@ the extension:
 3. Builds that into a place file with `rojo build` (override `lunit.studio.buildPlaceCommand` if you'd
    rather run tests against your project's *real* place -- see the note below).
 4. Generates the bootstrap script (also in this extension's storage directory, always regenerated) that
-   walks the synced tree for `*.test`/`*.spec` ModuleScripts and runs each one, and launches Studio against it.
+   walks the synced tree for `*.test`/`*.spec` ModuleScripts and runs each one (leaving out `@Tag("Lune")`
+   tests -- see [Choosing Lune vs. Studio per test](#choosing-lune-vs-studio-per-test)), and launches Studio
+   against it.
 
 Notes:
 - On Windows, `RobloxStudioBeta.exe` is auto-detected under `%LOCALAPPDATA%\Roblox\Versions`. On other
@@ -269,9 +271,23 @@ Both profiles run every discovered test by default. Tag a test with `@Tag("Studi
 if it needs real Roblox Studio -- `game`, real `Instance`s, mounting a `@rbxts/react`/`@rbxts/react-roblox`
 component -- and it's excluded from the **Run with Lune** profile entirely: never attempted, never shown as a
 failure there, not even offered for that profile on that item. `@Tag("Lune")` does the reverse for the rarer
-case of a test that should only run headlessly. No tag means it runs under both. This is enforced through two
-VS Code `TestTag`s the extension assigns based on Lunit's own `@Tag` decorator (parsed statically, not at
-runtime), one per profile.
+case of a test that should only run headlessly. No tag means it runs under both. Tags match
+case-insensitively.
+
+The rule is enforced at both ends:
+
+- **In VS Code**, through two `TestTag`s the extension assigns based on Lunit's own `@Tag` decorator (parsed
+  statically), one per profile. A test the profile leaves out is reported as **skipped** when a run covers
+  it (e.g. "run all"), never as failed or errored.
+- **In the generated runners**, which read the same tags from the compiled classes: the Lune runner leaves
+  out `@Tag("Studio")` classes and methods, and both Studio modes (live-sync and standalone) leave out
+  `@Tag("Lune")` ones. A class-level tag is recognised in the compiled source, so that module is not even
+  loaded. When you run a selection rather than everything, Studio runs just the selected classes and
+  methods.
+
+Studio yields a frame between test classes at least every 50 ms, so a long run doesn't freeze it. In
+live-sync mode the run also stops starting new classes once `lunit.studio.liveSync.timeoutSeconds` has
+passed, because by then VS Code has stopped waiting for results.
 
 ```ts
 import { Test, Tag } from "@rbxts/lunit";
