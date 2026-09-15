@@ -3,7 +3,7 @@
  * terminal) use to run this project's Lunit tests, since nothing outside VS
  * Code can press the Test Explorer's own Run button.
  *
- *   node <launcher> [--studio | --lune] [--json] [--port N] [--workspace DIR]
+ *   node <launcher> [--studio | --lune [--full]] [--json] [--port N] [--workspace DIR]
  *                   [--standalone] [filter ...]
  *
  * Two ways it can execute, tried in order:
@@ -40,6 +40,7 @@ import { CliRunRequest, LiveSyncBridge } from './liveSyncBridge';
 import { buildTestSelection } from './luauTestFilterTemplate';
 import { RunOutcome, runViaLune } from './luneRunner';
 import { createResultLineFilter, parseResultLines } from './resultProtocol';
+import { partitionSlowTests, slowTestFilterFor } from './runProfiles';
 import {
 	buildSummary,
 	formatSummary,
@@ -57,6 +58,8 @@ import { runViaStudio } from './studioRunner';
 
 interface CliArgs {
 	via: RunVia;
+	/** "Run with Lune (Full)": slow-tagged tests run too. Implies --lune. */
+	full: boolean;
 	json: boolean;
 	port?: number;
 	workspace?: string;
@@ -72,7 +75,10 @@ VS Code extension's Test Explorer does, and prints the same per-test results.
 
 Options:
   --studio          Run in Roblox Studio (default) -- same as "Run in Roblox Studio".
-  --lune            Run headlessly with Lune -- same as "Run with Lune".
+  --lune            Run headlessly with Lune -- same as "Run with Lune". Leaves out tests
+                    tagged with one of lunit.lune.slowTags.
+  --full            Run with Lune including slow-tagged tests -- same as "Run with Lune (Full)".
+                    Implies --lune.
   --json            Print the run summary as JSON on stdout (live output goes to stderr).
   --port <n>        Select an exact window port (otherwise discover from lunit.studio.liveSync.port or ${DEFAULT_LIVE_SYNC_PORT}).
   --workspace <dir> Workspace folder to use when running standalone (default: nearest
@@ -87,7 +93,8 @@ ANY filter matches it. No filters runs every test eligible for the chosen profil
 Exit code: 0 all passed/skipped, 1 any failed/errored, 2 could not run, 130 cancelled.`;
 
 function parseArgs(argv: string[]): CliArgs {
-	const args: CliArgs = { via: 'studio', json: false, standalone: false, help: false, filters: [] };
+	const args: CliArgs = { via: 'studio', full: false, json: false, standalone: false, help: false, filters: [] };
+	let studioRequested = false;
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
 		const [flag, inlineValue] = arg.startsWith('--') && arg.includes('=') ? arg.split(/=(.*)/s) : [arg, undefined];
@@ -104,9 +111,13 @@ function parseArgs(argv: string[]): CliArgs {
 		switch (flag) {
 			case '--studio':
 				args.via = 'studio';
+				studioRequested = true;
 				break;
 			case '--lune':
 				args.via = 'lune';
+				break;
+			case '--full':
+				args.full = true;
 				break;
 			case '--json':
 				args.json = true;
@@ -135,6 +146,12 @@ function parseArgs(argv: string[]): CliArgs {
 				}
 				args.filters.push(arg);
 		}
+	}
+	if (args.full) {
+		if (studioRequested) {
+			throw new Error('--full runs the Lune profile; it cannot be combined with --studio');
+		}
+		args.via = 'lune';
 	}
 	return args;
 }
@@ -469,10 +486,20 @@ async function runStandalone(
 	}
 
 	const all = discoverTests(config, onOutput);
-	const leaves = all.filter((leaf) => runsUnder(leaf.tags, args.via) && matchesFilters(leaf, args.filters, workspaceRoot));
-	if (leaves.length === 0) {
+	const eligible = all.filter((leaf) => runsUnder(leaf.tags, args.via) && matchesFilters(leaf, args.filters, workspaceRoot));
+	if (eligible.length === 0) {
 		const why = args.filters.length > 0 ? ` matching ${args.filters.map((f) => `"${f}"`).join(', ')}` : '';
 		return buildSummary(args.via, [], false, `no ${args.via === 'lune' ? 'Lune' : 'Roblox Studio'} tests were found${why} under ${workspaceRoot} (glob ${config.testGlob}).`);
+	}
+	// As in the extension's CLI route, a filter never counts as explicitly
+	// selecting a slow test; --full is how to run those.
+	const slow = partitionSlowTests(eligible, config.lune.slowTags, args.full, (leaf) => ({ tags: leaf.tags, explicit: false }));
+	const leaves = slow.run;
+	const slowFilter = slowTestFilterFor(config.lune.slowTags, args.full, []);
+	const withSlowCount = (summary: RunSummary): RunSummary =>
+		slow.leftOut.length > 0 ? { ...summary, slowLeftOut: slow.leftOut.length } : summary;
+	if (leaves.length === 0) {
+		return withSlowCount(buildSummary(args.via, [], false));
 	}
 
 	// Own the live-sync port for the duration of the run so an already-open
@@ -500,30 +527,31 @@ async function runStandalone(
 	try {
 		outcome =
 			args.via === 'lune'
-				? await runViaLune(config, cancel.token, chunkSink)
+				? await runViaLune(config, cancel.token, chunkSink, slowFilter)
 				: await runViaStudio(
 						config,
 						cancel.token,
 						chunkSink,
 						bridge,
 						args.filters.length > 0 ? buildTestSelection(leaves) : undefined,
+						slowFilter,
 					);
 	} catch (err) {
 		displayFilter.flush();
 		const message = `[lunit] test run failed: ${String(err)}`;
 		onOutput(message + '\n');
-		return buildSummary(args.via, leaves.map((leaf) => ({ ...identityOnly(leaf), status: 'errored', message })), false);
+		return withSlowCount(buildSummary(args.via, leaves.map((leaf) => ({ ...identityOnly(leaf), status: 'errored', message })), false));
 	} finally {
 		ownedBridge?.stop();
 	}
 	displayFilter.flush();
 
 	if (outcome.cancelled) {
-		return buildSummary(args.via, leaves.map((leaf) => ({ ...identityOnly(leaf), status: 'skipped' })), true);
+		return withSlowCount(buildSummary(args.via, leaves.map((leaf) => ({ ...identityOnly(leaf), status: 'skipped' })), true));
 	}
 	const records = parseResultLines(outcome.output);
 	const results: TestResultEntry[] = leaves.map((leaf) => ({ ...identityOnly(leaf), ...resolveVerdict(leaf, records, outcome) }));
-	return buildSummary(args.via, results, false);
+	return withSlowCount(buildSummary(args.via, results, false));
 }
 
 function identityOnly(leaf: DiscoveredLeaf): TestIdentity {
@@ -586,7 +614,7 @@ async function main(): Promise<number> {
 		// Preserve legacy extensions and explicit --port. Never send a run to
 		// a discovered modern window that belongs to an unrelated workspace.
 		const result: ExtensionRunResult = target || args.port !== undefined || discovered.length === 0
-			? await runThroughExtension(target?.port ?? port, { cwd: args.workspace ?? cwd, via: args.via, filters: args.filters }, live, cancel, target?.instanceId)
+			? await runThroughExtension(target?.port ?? port, { cwd: args.workspace ?? cwd, via: args.via, filters: args.filters, full: args.full }, live, cancel, target?.instanceId)
 			: { kind: 'not-listening' };
 		if (result.kind === 'done') {
 			summary = result.summary;

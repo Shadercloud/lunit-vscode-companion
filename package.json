@@ -2,7 +2,7 @@
   "name": "vscode-lunit-companion",
   "displayName": "Lunit Test Companion",
   "description": "Discover and run @rbxts/lunit tests from VS Code's Test Explorer.",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "publisher": "ShaderCloud",
   "author": "ShaderCloud",
   "license": "MIT",
@@ -117,6 +117,14 @@
           "type": "string",
           "default": "",
           "description": "Rojo project file describing the DataModel for a roblox-ts game project (--type game), whose compiled output resolves every import through absolute DataModel paths rather than relative ones. Leave empty to detect the project type from the compiled output and pick the Rojo project automatically; set it when several Rojo projects at the workspace root could describe your tests. Ignored for package projects, which keep using lunit.testsRoot / lunit.lunitRoot."
+        },
+        "lunit.lune.slowTags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Tags marking slow tests (matched case-insensitively, on the class or the method), e.g. `[\"Slow\"]`. **Run with Lune** and **Run in Roblox Studio** leave these tests out, and the run report says how many, unless you run a single slow test directly. Setting any tag adds a **Run with Lune (Full)** profile that runs them too (`--full` on the command line)."
         },
         "lunit.lune.executable": {
           "type": "string",

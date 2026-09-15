@@ -8,6 +8,13 @@ import { DiscoveredClass, parseTestFile } from './discovery';
 import { CliRunRequest, LiveSyncBridge } from './liveSyncBridge';
 import { buildTestSelection } from './luauTestFilterTemplate';
 import { RunOutcome, runViaLune } from './luneRunner';
+import {
+	partitionSlowTests,
+	RunProfileId,
+	runProfileSpecs,
+	slowLeftOutMessage,
+	slowTestFilterFor,
+} from './runProfiles';
 import { createResultLineFilter, parseResultLines, ResultRecord } from './resultProtocol';
 import { isRojoServeRunning } from './rojoDetect';
 import {
@@ -36,6 +43,8 @@ interface TestMeta {
 	className?: string;
 	methodName?: string;
 	displayName?: string;
+	/** A test's effective @Tag values (class-level and its own). */
+	tags?: string[];
 }
 
 let outputChannel: vscode.OutputChannel;
@@ -44,9 +53,8 @@ let liveSyncBridge: LiveSyncBridge | undefined;
 const metaById = new Map<string, TestMeta>();
 /** Resolves once the initial discovery pass (kicked off in activate) has finished. */
 let initialDiscovery: Promise<void> = Promise.resolve();
-/** The two run profiles, kept here so runFromCli can attribute its TestRunRequest to the right one. */
-let luneProfileRef: vscode.TestRunProfile | undefined;
-let studioProfileRef: vscode.TestRunProfile | undefined;
+/** The registered run profiles, kept here so runFromCli can attribute its TestRunRequest to the right one. */
+const profileRefs = new Map<RunProfileId, vscode.TestRunProfile>();
 
 /**
  * Set as each run profile's own `tag` (see createRunProfile's `tag` param),
@@ -61,6 +69,11 @@ let studioProfileRef: vscode.TestRunProfile | undefined;
  * discovery.ts, case-insensitive, class-level tags apply to every method in
  * the class): `@Tag("Studio")` means "skip under Lune", `@Tag("Lune")` means
  * "skip under Roblox Studio", no matching tag means "runs under both".
+ *
+ * Slow tests (`lunit.lune.slowTags`) keep their profile tags on purpose: both
+ * "Run with Lune" (for an explicitly selected slow test) and "Run with Lune
+ * (Full)", which shares LUNE_TAG, must stay offered for them. The slow rule
+ * itself is applied in executeRun.
  */
 const LUNE_TAG = new vscode.TestTag('lunit.lune');
 const STUDIO_TAG = new vscode.TestTag('lunit.studio');
@@ -224,76 +237,84 @@ export function activate(context: vscode.ExtensionContext): void {
 	// no-op and stale items (e.g. a commented-out @Test) never get re-synced.
 	controller.refreshHandler = () => discoverAll(controller);
 
-	// Only one of these two profiles should ever be "default" at a time --
-	// VS Code's own "Select Default Profile" picker lets you check both
-	// simultaneously (it's built for kinds where running several defaults
-	// together makes sense), so each profile's onDidChangeDefault listener
-	// below un-defaults the other one to force a single-select choice
-	// instead. Explicitly running a profile from the Run dropdown also marks
-	// it default (and the other not) -- harmless if it already was.
-	let studioProfile: vscode.TestRunProfile | undefined;
-
-	const luneProfile = controller.createRunProfile(
-		'Run with Lune',
-		vscode.TestRunProfileKind.Run,
-		(request, token) => {
-			luneProfile.isDefault = true;
-			if (studioProfile) {
-				studioProfile.isDefault = false;
+	// Only one profile should ever be "default" at a time -- VS Code's own
+	// "Select Default Profile" picker lets you check several simultaneously
+	// (it's built for kinds where running several defaults together makes
+	// sense), so each profile's onDidChangeDefault listener below un-defaults
+	// the others to force a single-select choice instead. Explicitly running a
+	// profile from the Run dropdown also marks it default (and the others not)
+	// -- harmless if it already was.
+	const profileListeners = new Map<RunProfileId, vscode.Disposable>();
+	const makeSoleDefault = (id: RunProfileId) => {
+		for (const [otherId, other] of profileRefs) {
+			if (otherId !== id) {
+				other.isDefault = false;
 			}
-			return executeRun(controller, request, token, 'lune').then(() => undefined);
-		},
-		true,
-		LUNE_TAG,
-	);
-	luneProfileRef = luneProfile;
-	context.subscriptions.push(luneProfile);
-	context.subscriptions.push(
-		luneProfile.onDidChangeDefault((isDefault) => {
-			if (isDefault && studioProfile) {
-				studioProfile.isDefault = false;
-			}
-		}),
-	);
-
-	let studioDefaultListener: vscode.Disposable | undefined;
-	const registerStudioProfile = () => {
+		}
+	};
+	// Which profiles exist follows settings (see runProfileSpecs): the Full
+	// profile only with lunit.lune.slowTags, the Studio one unless disabled.
+	const syncProfiles = () => {
 		const folder = vscode.workspace.workspaceFolders?.[0];
-		const enabled = folder ? getConfig(folder, getStorageDir(folder)).studio.enabled : true;
-		if (enabled && !studioProfile) {
+		const config = folder ? getConfig(folder, getStorageDir(folder)) : undefined;
+		const specs = runProfileSpecs({
+			studioEnabled: config?.studio.enabled ?? true,
+			slowTags: config?.lune.slowTags ?? [],
+		});
+		const wanted = new Set(specs.map((spec) => spec.id));
+		for (const [id, profile] of [...profileRefs]) {
+			if (!wanted.has(id)) {
+				profileListeners.get(id)?.dispose();
+				profileListeners.delete(id);
+				profile.dispose();
+				profileRefs.delete(id);
+			}
+		}
+		for (const spec of specs) {
+			if (profileRefs.has(spec.id)) {
+				continue;
+			}
 			const profile = controller.createRunProfile(
-				'Run in Roblox Studio',
+				spec.label,
 				vscode.TestRunProfileKind.Run,
 				(request, token) => {
 					profile.isDefault = true;
-					luneProfile.isDefault = false;
-					return executeRun(controller, request, token, 'studio').then(() => undefined);
+					makeSoleDefault(spec.id);
+					return executeRun(controller, request, token, spec.via, { includeSlow: spec.includeSlow }).then(
+						() => undefined,
+					);
 				},
-				false,
-				STUDIO_TAG,
+				spec.isDefault,
+				spec.via === 'lune' ? LUNE_TAG : STUDIO_TAG,
 			);
-			studioProfile = profile;
-			studioProfileRef = profile;
-			context.subscriptions.push(profile);
-			studioDefaultListener = profile.onDidChangeDefault((isDefault) => {
-				if (isDefault) {
-					luneProfile.isDefault = false;
-				}
-			});
-			context.subscriptions.push(studioDefaultListener);
-		} else if (!enabled && studioProfile) {
-			studioDefaultListener?.dispose();
-			studioDefaultListener = undefined;
-			studioProfile.dispose();
-			studioProfile = undefined;
-			studioProfileRef = undefined;
+			profileRefs.set(spec.id, profile);
+			profileListeners.set(
+				spec.id,
+				profile.onDidChangeDefault((isDefault) => {
+					if (isDefault) {
+						makeSoleDefault(spec.id);
+					}
+				}),
+			);
+		}
+		// Removing the default profile must not leave none.
+		if (![...profileRefs.values()].some((profile) => profile.isDefault)) {
+			profileRefs.get('lune')!.isDefault = true;
 		}
 	};
-	registerStudioProfile();
+	syncProfiles();
+	context.subscriptions.push({
+		dispose: () => {
+			profileListeners.forEach((listener) => listener.dispose());
+			profileRefs.forEach((profile) => profile.dispose());
+			profileListeners.clear();
+			profileRefs.clear();
+		},
+	});
 	context.subscriptions.push(
 		vscode.workspace.onDidChangeConfiguration((e) => {
-			if (e.affectsConfiguration('lunit.studio.enabled')) {
-				registerStudioProfile();
+			if (e.affectsConfiguration('lunit.studio.enabled') || e.affectsConfiguration('lunit.lune.slowTags')) {
+				syncProfiles();
 			}
 			if (e.affectsConfiguration('lunit.explorer')) {
 				void discoverAll(controller);
@@ -324,7 +345,7 @@ export function activate(context: vscode.ExtensionContext): void {
 				? `node "${cliLauncherPath}" --studio`
 				: 'the CLI launcher could not be written (see the Lunit output channel)';
 			const choice = await vscode.window.showInformationMessage(
-				`Lunit: agents (or you) can run the tests from any terminal with: ${command}  -- results are identical to the Test Explorer's, and also show up there. Add --lune for the Lune profile, --json for machine-readable output, or test/file name filters.`,
+				`Lunit: agents (or you) can run the tests from any terminal with: ${command}  -- results are identical to the Test Explorer's, and also show up there. Add --lune for the Lune profile (--lune --full to include slow tests), --json for machine-readable output, or test/file name filters.`,
 				...(cliLauncherPath ? ['Copy Command'] : []),
 			);
 			if (choice === 'Copy Command') {
@@ -458,9 +479,19 @@ async function runFromCli(
 			return buildSummary(request.via, [], false, `no ${request.via === 'lune' ? 'Lune' : 'Roblox Studio'} tests were found${why}.`);
 		}
 
-		const profile = request.via === 'lune' ? luneProfileRef : studioProfileRef;
+		// --full only means something for Lune; slow tests matched by a CLI
+		// filter are never "explicitly selected" (use --full for those).
+		const includeSlow = request.via === 'lune' && request.full === true;
+		const profile =
+			request.via === 'studio'
+				? profileRefs.get('studio')
+				: (includeSlow && profileRefs.get('luneFull')) || profileRefs.get('lune');
 		const runRequest = new vscode.TestRunRequest(include, undefined, profile);
-		return await executeRun(controller, runRequest, cancel, request.via, onOutput);
+		return await executeRun(controller, runRequest, cancel, request.via, {
+			includeSlow,
+			onOutput,
+			explicitTests: false,
+		});
 	} finally {
 		cliRunInProgress = false;
 	}
@@ -595,6 +626,7 @@ async function updateFile(controller: vscode.TestController, uri: vscode.Uri): P
 				className: cls.className,
 				methodName: test.methodName,
 				displayName: test.displayName,
+				tags: [...cls.tags, ...test.tags],
 			});
 			return testItem;
 		});
@@ -717,13 +749,26 @@ function collectLeaves(item: vscode.TestItem, into: vscode.TestItem[]): void {
  * was applied to each TestItem -- via resolveVerdict in runReport.ts, so
  * neither route can drift from the other.
  */
+interface ExecuteRunOptions {
+	/** "Run with Lune (Full)": slow tests run even when not selected explicitly. */
+	includeSlow: boolean;
+	onOutput?: (text: string) => void;
+	/**
+	 * Whether a test item named directly in `request.include` counts as
+	 * explicitly selected, so it runs even if slow (default true). The CLI
+	 * route passes false: its include list is whatever its filters matched.
+	 */
+	explicitTests?: boolean;
+}
+
 async function executeRun(
 	controller: vscode.TestController,
 	request: vscode.TestRunRequest,
 	token: CancelSignal,
 	via: RunVia,
-	onOutput?: (text: string) => void,
+	options: ExecuteRunOptions,
 ): Promise<RunSummary> {
+	const { onOutput } = options;
 	const run = controller.createTestRun(request);
 	const excluded = new Set((request.exclude ?? []).map((i) => i.id));
 
@@ -733,6 +778,13 @@ async function executeRun(
 	} else {
 		controller.items.forEach((item) => roots.push(item));
 	}
+	// Running a folder, file or class is not selecting its slow tests; running
+	// the test itself is.
+	const explicitIds = new Set(
+		options.explicitTests === false
+			? []
+			: (request.include ?? []).filter((item) => metaById.get(item.id)?.kind === 'test').map((item) => item.id),
+	);
 
 	// request.include is undefined for a whole-tree run ("run all tests" --
 	// see TestRunRequest's doc comment), which VS Code does NOT pre-filter by
@@ -741,7 +793,7 @@ async function executeRun(
 	// re-checking the tag here is what actually keeps a @Tag("Studio") test
 	// out of a Lune run rather than just out of its dropdown.
 	const requiredTag = via === 'lune' ? LUNE_TAG : STUDIO_TAG;
-	const leaves: vscode.TestItem[] = [];
+	const eligible: vscode.TestItem[] = [];
 	const leftOut: vscode.TestItem[] = [];
 	for (const root of roots) {
 		const candidates: vscode.TestItem[] = [];
@@ -750,7 +802,7 @@ async function executeRun(
 			if (excluded.has(candidate.id)) {
 				continue;
 			}
-			(candidate.tags.some((t) => t.id === requiredTag.id) ? leaves : leftOut).push(candidate);
+			(candidate.tags.some((t) => t.id === requiredTag.id) ? eligible : leftOut).push(candidate);
 		}
 	}
 
@@ -759,13 +811,13 @@ async function executeRun(
 	// them out on their side too (luauTestFilterTemplate.ts).
 	const leftOutResults = applyVerdicts(run, leftOut, () => ({ status: 'skipped' }));
 
-	if (leaves.length === 0) {
+	if (eligible.length === 0) {
 		run.end();
 		return buildSummary(via, leftOutResults, false, 'no tests to run.');
 	}
 
 	const folder =
-		vscode.workspace.getWorkspaceFolder(leaves[0].uri!) ?? vscode.workspace.workspaceFolders?.[0];
+		vscode.workspace.getWorkspaceFolder(eligible[0].uri!) ?? vscode.workspace.workspaceFolders?.[0];
 	if (!folder) {
 		const message = 'Lunit: no workspace folder available to run tests in.';
 		vscode.window.showErrorMessage(message);
@@ -773,6 +825,36 @@ async function executeRun(
 		return buildSummary(via, [], false, message);
 	}
 	const config = getConfig(folder, getStorageDir(folder));
+
+	// Slow tests the run did not ask for by name are left out without a
+	// verdict (not skipped, not failed) and only counted in the report.
+	const slow = partitionSlowTests(eligible, config.lune.slowTags, options.includeSlow, (leaf) => ({
+		tags: metaById.get(leaf.id)?.tags ?? [],
+		explicit: explicitIds.has(leaf.id),
+	}));
+	const leaves = slow.run;
+	const slowFilter = slowTestFilterFor(
+		config.lune.slowTags,
+		options.includeSlow,
+		slow.explicitSlow.map(identityOf).filter((identity): identity is TestIdentity => identity !== undefined),
+	);
+	const endRun = () => {
+		if (slow.leftOut.length > 0) {
+			const note = `[lunit] ${slowLeftOutMessage(slow.leftOut.length)}\n`;
+			outputChannel.append(note);
+			run.appendOutput(note.replace(/\n/g, '\r\n'));
+			onOutput?.(note);
+		}
+		run.end();
+	};
+	const withSlowCount = (summary: RunSummary): RunSummary =>
+		slow.leftOut.length > 0 ? { ...summary, slowLeftOut: slow.leftOut.length } : summary;
+
+	if (leaves.length === 0) {
+		// Everything eligible was slow: say so rather than "no tests".
+		endRun();
+		return withSlowCount(buildSummary(via, leftOutResults, false));
+	}
 
 	for (const leaf of leaves) {
 		run.enqueued(leaf);
@@ -798,8 +880,8 @@ async function executeRun(
 	try {
 		outcome =
 			via === 'lune'
-				? await runViaLune(config, token, chunkSink)
-				: await runViaStudio(config, token, chunkSink, liveSyncBridge, selection);
+				? await runViaLune(config, token, chunkSink, slowFilter)
+				: await runViaStudio(config, token, chunkSink, liveSyncBridge, selection, slowFilter);
 	} catch (err) {
 		displayFilter.flush();
 		const message = `[lunit] test run failed: ${String(err)}`;
@@ -807,21 +889,21 @@ async function executeRun(
 		run.appendOutput(message.replace(/\n/g, '\r\n'));
 		onOutput?.(message + '\n');
 		const results = applyVerdicts(run, leaves, () => ({ status: 'errored', message }));
-		run.end();
-		return buildSummary(via, [...results, ...leftOutResults], false);
+		endRun();
+		return withSlowCount(buildSummary(via, [...results, ...leftOutResults], false));
 	}
 	displayFilter.flush();
 
 	if (outcome.cancelled) {
 		const results = applyVerdicts(run, leaves, () => ({ status: 'skipped' }));
-		run.end();
-		return buildSummary(via, [...results, ...leftOutResults], true);
+		endRun();
+		return withSlowCount(buildSummary(via, [...results, ...leftOutResults], true));
 	}
 
 	const records = parseResultLines(outcome.output);
 	const results = applyVerdicts(run, leaves, (identity) => resolveVerdict(identity, records, outcome));
-	run.end();
-	return buildSummary(via, [...results, ...leftOutResults], false);
+	endRun();
+	return withSlowCount(buildSummary(via, [...results, ...leftOutResults], false));
 }
 
 /**

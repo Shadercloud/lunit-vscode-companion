@@ -4,6 +4,7 @@ import { CancelSignal } from './cancelSignal';
 import { LunitConfig } from './config';
 import { buildLuneGameRunnerScript } from './luneGameScriptTemplate';
 import { detectLuneProject } from './luneProjectKind';
+import { SlowTestFilter } from './luauTestFilterTemplate';
 import { buildLuneRunnerScript } from './luneScriptTemplate';
 import { runCommand } from './processRunner';
 import { buildRojoDataModelModule } from './rojoDataModelTemplate';
@@ -40,11 +41,13 @@ function toLuneRequirePath(fromDir: string, toFileNoExt: string): string | undef
 /**
  * Compiles the project (unless skipped), regenerates our structured-output
  * Lune entry script, and runs it, streaming combined output via `onOutput`.
+ * `slow`, when given, leaves out the slow tests it does not explicitly allow.
  */
 export async function runViaLune(
 	config: LunitConfig,
 	token: CancelSignal,
 	onOutput: (chunk: string) => void,
+	slow?: SlowTestFilter,
 ): Promise<RunOutcome> {
 	const cwd = config.workspaceRoot;
 
@@ -77,7 +80,7 @@ export async function runViaLune(
 	}
 	if (detection.kind === 'game') {
 		onOutput(`[lunit] ${detection.reason}.\n`);
-		return runGameProject(config, detection.projectFile!, token, onOutput);
+		return runGameProject(config, detection.projectFile!, token, onOutput, slow);
 	}
 
 	const promisePath = path.join(cwd, LUNIT_PROMISE_RELATIVE);
@@ -103,7 +106,7 @@ export async function runViaLune(
 	}
 	const scriptPath = path.join(scriptDir, GENERATED_SCRIPT_NAME);
 	await fs.promises.mkdir(scriptDir, { recursive: true });
-	await fs.promises.writeFile(scriptPath, buildLuneRunnerScript(promiseRequirePath!), 'utf8');
+	await fs.promises.writeFile(scriptPath, buildLuneRunnerScript(promiseRequirePath!, slow), 'utf8');
 
 	// The generated script's own path-manipulation (Parent lookups, child
 	// concatenation -- see luneScriptTemplate.ts / luauShimTemplate.ts) is all
@@ -139,6 +142,7 @@ async function runGameProject(
 	projectFile: string,
 	token: CancelSignal,
 	onOutput: (chunk: string) => void,
+	slow: SlowTestFilter | undefined,
 ): Promise<RunOutcome> {
 	const cwd = config.workspaceRoot;
 	const scriptDir = config.storageDir;
@@ -151,7 +155,7 @@ async function runGameProject(
 	const scriptPath = path.join(scriptDir, GENERATED_GAME_SCRIPT_NAME);
 	await fs.promises.writeFile(
 		scriptPath,
-		buildLuneGameRunnerScript(`./${GENERATED_DATA_MODEL_NAME.replace(/\.luau$/, '')}`),
+		buildLuneGameRunnerScript(`./${GENERATED_DATA_MODEL_NAME.replace(/\.luau$/, '')}`, slow),
 		'utf8',
 	);
 

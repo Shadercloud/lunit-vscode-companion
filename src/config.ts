@@ -45,6 +45,12 @@ export interface LunitConfig {
 		 * see luneProjectKind.ts.
 		 */
 		projectFile: string;
+		/**
+		 * Tags marking slow tests, left out of "Run with Lune" and "Run in
+		 * Roblox Studio" unless selected explicitly; "Run with Lune (Full)"
+		 * runs them. Empty turns the feature (and the Full profile) off.
+		 */
+		slowTags: string[];
 	};
 	studio: {
 		enabled: boolean;
@@ -74,6 +80,14 @@ export const DEFAULT_LIVE_SYNC_PORT = 34873;
  * through, while the CLI backs it with the workspace's `.vscode/settings.json`.
  */
 export type SettingReader = <T>(key: string, fallback: T) => T;
+
+/** A hand-edited settings value as a clean tag list: strings only, trimmed, no blanks. */
+function normalizeTagList(value: unknown): string[] {
+	if (!Array.isArray(value)) {
+		return [];
+	}
+	return value.filter((tag): tag is string => typeof tag === 'string').map((tag) => tag.trim()).filter((tag) => tag.length > 0);
+}
 
 /** Every default in one place -- must match the `contributes.configuration` block in package.json. */
 export function buildConfig(root: string, storageDir: string, get: SettingReader): LunitConfig {
@@ -105,6 +119,7 @@ export function buildConfig(root: string, storageDir: string, get: SettingReader
 			testsRoot: resolveTokens(get<string>('testsRoot', '${workspaceFolder}'), baseTokens),
 			lunitRoot: resolveTokens(get<string>('lunitRoot', '${workspaceFolder}/node_modules/@rbxts/lunit/out'), baseTokens),
 			projectFile: resolveTokens(get<string>('lune.projectFile', ''), baseTokens),
+			slowTags: normalizeTagList(get<unknown>('lune.slowTags', [])),
 		},
 		studio: {
 			enabled: get<boolean>('studio.enabled', true),

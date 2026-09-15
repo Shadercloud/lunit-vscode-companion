@@ -1,9 +1,11 @@
 import { buildLuauEmitHelpers } from './luauEmitHelpers';
-import { buildLuauTestFilterHelpers, TestSelection } from './luauTestFilterTemplate';
+import { buildLuauTestFilterHelpers, SlowTestFilter, TestSelection } from './luauTestFilterTemplate';
 
 export interface LiveSyncJobOptions {
 	/** Narrows the run to an explicit Test Explorer request; undefined runs everything. */
 	selection?: TestSelection;
+	/** Slow tests to leave out unless named explicitly; see luauTestFilterTemplate.ts. */
+	slow?: SlowTestFilter;
 	/** Stop starting new test classes after this long (the extension's live-sync timeout). */
 	deadlineSeconds?: number;
 }
@@ -20,7 +22,7 @@ if owner == nil then
 	return "[lunit] ERROR: the loaded Studio bridge is outdated. Run Lunit: Install Roblox Studio Live-Sync Plugin in VS Code, then reload LunitStudioBridge in Studio (PluginDebugService > Save and Reload Plugin)."
 end
 ${buildLuauEmitHelpers()}
-${buildLuauTestFilterHelpers('Lune', options.selection)}
+${buildLuauTestFilterHelpers('Lune', options.selection, options.slow)}
 local DEADLINE_SECONDS = ${Number.isFinite(deadline) ? Math.max(0, Math.floor(deadline)) : 30}
 local started = os.clock()
 local root = Instance.new("Folder")
@@ -283,7 +285,7 @@ local ok, failure = xpcall(function()
 	end
 	local lunit = runtime.import(copies[runtimes[1]], copies[framework])
 	loadSeconds += os.clock() - loadStart
-	local classesLeftOut, testsLeftOut = 0, 0
+	local classesLeftOut, testsLeftOut, slowLeftOut = 0, 0, 0
 	for index, original in tests do
 		-- The extension stops waiting at its live-sync timeout, and nothing can
 		-- cancel this job from outside, so stop starting classes by then too.
@@ -311,9 +313,10 @@ local ok, failure = xpcall(function()
 			log("ERROR: failed to load test module " .. original:GetFullName() .. ": " .. tostring(cls))
 		elseif type(cls) == "table" then
 			local className = tostring(cls)
-			local run, classLeftOut, methodsLeftOut = lunitFilterClass(cls, className)
+			local run, classLeftOut, methodsLeftOut, slowMethodsLeftOut = lunitFilterClass(cls, className)
 			if classLeftOut then classesLeftOut += 1 end
 			testsLeftOut += methodsLeftOut
+			slowLeftOut += slowMethodsLeftOut
 			if run then
 				local executionStart = os.clock()
 				local ran, err = pcall(lunitRunClass, lunit, cls, className)
@@ -328,6 +331,7 @@ local ok, failure = xpcall(function()
 		log("left out " .. classesLeftOut .. " " .. LUNIT_EXCLUDED_TAG .. "-tagged test class(es) and "
 			.. testsLeftOut .. " " .. LUNIT_EXCLUDED_TAG .. "-tagged test(s): run them with the Lune profile.")
 	end
+	if slowLeftOut > 0 then log(lunitSlowLeftOutNote(slowLeftOut)) end
 end, debug.traceback)
 if not ok then log("ERROR: " .. tostring(failure)) end
 local cleanupStart = os.clock()

@@ -84,6 +84,8 @@ export interface RunSummary {
 	tests: TestResultEntry[];
 	counts: Record<VerdictStatus, number>;
 	error?: string;
+	/** Slow-tagged tests the run left out (not in `tests`); see runProfiles.ts. */
+	slowLeftOut?: number;
 }
 
 /** Marker prefixing the JSON summary line the extension streams back to the CLI at the end of a `/run`. */
@@ -152,6 +154,9 @@ export function formatSummary(summary: RunSummary, workspaceRoot: string): strin
 	}
 	lines.push('');
 	lines.push(`[lunit] ${summary.tests.length} tests via ${target}: ${parts.join(', ')}.`);
+	if (summary.slowLeftOut) {
+		lines.push(`[lunit] Left out ${summary.slowLeftOut} slow test(s): add --full to run them with Lune.`);
+	}
 	return lines.join('\n');
 }
 

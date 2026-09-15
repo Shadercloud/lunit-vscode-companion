@@ -10,6 +10,8 @@ export interface CliRunRequest {
 	via: RunVia;
 	/** See runReport.ts's `matchesFilters`. */
 	filters: string[];
+	/** With `via: 'lune'`, "Run with Lune (Full)": include slow-tagged tests. */
+	full?: boolean;
 }
 
 /**
@@ -261,7 +263,7 @@ export class LiveSyncBridge {
 				if (typeof parsed.cwd !== 'string' || (parsed.via !== 'lune' && parsed.via !== 'studio')) {
 					throw new Error('missing cwd/via');
 				}
-				request = { cwd: parsed.cwd, via: parsed.via, filters: Array.isArray(parsed.filters) ? parsed.filters.map(String) : [] };
+				request = { cwd: parsed.cwd, via: parsed.via, filters: Array.isArray(parsed.filters) ? parsed.filters.map(String) : [], full: parsed.full === true };
 			} catch {
 				res.statusCode = 400;
 				res.end('Malformed /run request body.');

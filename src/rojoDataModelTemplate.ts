@@ -481,11 +481,22 @@ function rbx.loadProject(projectFile)
 		end
 		loading[module] = true
 		local ok, value = pcall(function()
-			local chunk = luau.load(fs.readFile(source), {
+			-- The module's globals arrive as locals of the chunk, not through a
+			-- custom environment: a custom environment switches off Luau's fast
+			-- builtin calls (math, bit32, buffer...), which made compute-heavy
+			-- tests run far slower than in Studio. The prelude shares the first
+			-- line, so line numbers in errors stay right. These names count
+			-- towards Luau's 200 locals per function, and a module assigning an
+			-- undeclared global now writes Lune's shared globals.
+			local names, values = {}, {}
+			for name, value in environmentFor(module) do
+				table.insert(names, name)
+				table.insert(values, value)
+			end
+			local chunk = luau.load("local " .. table.concat(names, ", ") .. " = ...; " .. fs.readFile(source), {
 				debugName = source,
-				environment = environmentFor(module),
 			})
-			return chunk()
+			return chunk(table.unpack(values, 1, #names))
 		end)
 		loading[module] = nil
 		if not ok then

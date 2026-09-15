@@ -37,7 +37,7 @@ node("ModuleScript", "out", node("Folder", "lunit", scope), "node_modules/@rbxts
 node("ModuleScript", "helper", node("Folder", "Shared", replicatedStorage), "out/shared/helper.luau")
 
 local server = node("Folder", "Server", game:GetService("ServerScriptService"))
-for _, name in { "server", "tagged", "luneOnly", "mixedTags" } do
+for _, name in { "server", "tagged", "luneOnly", "mixedTags", "slow", "slowOnly" } do
 	node("ModuleScript", name .. ".test", server, "out/server/" .. name .. ".test.luau")
 end
 -- A class-level Lune tag visible only in the loaded class's metadata (lower

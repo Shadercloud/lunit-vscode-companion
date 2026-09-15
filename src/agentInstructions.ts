@@ -106,6 +106,9 @@ ${cliCommand(cliLauncherPath, '--studio')}
 - \`--studio\` (default) runs in Roblox Studio; \`--lune\` runs headlessly with
   Lune (Lune can't run \`@Tag("Studio")\` tests, so prefer \`--studio\` to
   verify everything at once).
+- Tests tagged with one of the project's \`lunit.lune.slowTags\` (e.g.
+  \`@Tag("Slow")\` long sweeps) are left out of \`--lune\` and \`--studio\`, and
+  the summary says how many; add \`--full\` to run them too.
 - Add one or more filters to run a subset, e.g. \`... --studio MyFeature\`
   or \`... --studio src/foo.test.ts\` -- case-insensitive substrings matched
   against each test's file path, class name, method name and display name.

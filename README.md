@@ -87,7 +87,8 @@ export = TestSum;
 
 Save the file, open the **Testing** view in the sidebar (flask icon), and the test appears automatically.
 Click the play button next to it -- or use the dropdown next to Run to choose **Run with Lune** or
-**Run in Roblox Studio** -- and results show up right there in the tree. No project-side configuration,
+**Run in Roblox Studio** (plus **Run with Lune (Full)** if you've set up
+[slow tests](#slow-tests-and-the-full-profile)) -- and results show up right there in the tree. No project-side configuration,
 Rojo project file, or test-runner script needed; see [What it does](#what-it-does) below for how each
 profile actually runs things.
 
@@ -303,6 +304,46 @@ class MountsAComponent {
 export = MountsAComponent;
 ```
 
+### Slow tests and the Full profile
+
+Long sweeps can be kept out of the everyday run. List their tags in **`lunit.lune.slowTags`** (default `[]`,
+so nothing changes until you set it):
+
+```json
+"lunit.lune.slowTags": ["Slow"]
+```
+
+A test is slow when its class or the method carries one of those tags (matched case-insensitively). With the
+setting in place:
+
+| Profile | Runs |
+|---|---|
+| **Run with Lune** (the default) | Everything that runs under Lune, except slow tests |
+| **Run with Lune (Full)** | Everything that runs under Lune, slow tests included |
+| **Run in Roblox Studio** | As before, and also without slow tests |
+
+The Full profile only appears while `lunit.lune.slowTags` names at least one tag.
+
+- Running a folder, file or class leaves its slow tests out. They aren't reported as skipped or failed. The
+  run output says how many were left out instead: "Left out 12 slow test(s): run with Lune (Full)." A class
+  whose only tests are slow leaves nothing to run without that being an error.
+- Running **one slow test directly** runs it under either Lune profile, since you asked for that test by
+  name. Slow tests can always be run from both Lune profiles in the Test Explorer.
+- On the command line, `--lune` leaves slow tests out and `--full` includes them (`--full` implies
+  `--lune`). A filter that matches a slow test doesn't count as selecting it directly: use `--full`.
+
+```ts
+@Tag("Lune")
+class WorldGeneration {
+	@Test
+	public buildsOneChunk() {}
+
+	@Test
+	@Tag("Slow")
+	public sweepsAHundredSeeds() {} // only in "Run with Lune (Full)"
+}
+```
+
 ## Running tests from the command line (for coding agents)
 
 Nothing outside VS Code can press the Test Explorer's Run button, so the extension ships a command-line
@@ -317,7 +358,9 @@ node "<VS Code user data>/globalStorage/shadercloud.vscode-lunit-companion/lunit
 That launcher is a one-line file the extension rewrites on every activation to point at the currently
 installed version, so the path stays stable across extension updates. Options:
 
-- `--studio` (default) is "Run in Roblox Studio"; `--lune` is "Run with Lune".
+- `--studio` (default) is "Run in Roblox Studio"; `--lune` is "Run with Lune"; `--full` is "Run with Lune
+  (Full)", which also runs tests tagged with one of `lunit.lune.slowTags` (see
+  [Slow tests and the Full profile](#slow-tests-and-the-full-profile)).
 - Any other arguments are filters: case-insensitive substrings matched against each test's
   workspace-relative file path, class name, method name and display name (a test runs if any filter
   matches). `... --studio MyFeature` or `... --studio src/foo.test.ts`, for example.

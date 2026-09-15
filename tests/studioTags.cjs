@@ -49,17 +49,31 @@ const SELECTION = buildTestSelection([
 	{ file: 'mixedTags.test.ts', className: 'MixedTagTests', methodName: 'runsInStudio' },
 	{ file: 'mixedTags.test.ts', className: 'MixedTagTests', methodName: 'runsOnlyUnderLune' },
 	{ file: 'luneOnly.test.ts', className: 'LuneOnlyTests', methodName: 'mustNotRunInStudio' },
+	{ file: 'slowOnly.test.ts', className: 'SlowOnlyTests', methodName: 'sweepAll' },
 ]);
+
+// lunit.lune.slowTags = ["Slow"]. A whole-tree run allows no slow test; the
+// selected run explicitly selected SlowOnlyTests.sweepAll, so that one runs.
+const SLOW_ALL = { tags: ['Slow'] };
+const SLOW_SELECTED = {
+	tags: ['Slow'],
+	allowed: buildTestSelection([{ file: 'slowOnly.test.ts', className: 'SlowOnlyTests', methodName: 'sweepAll' }]),
+};
 
 const RUN_ALL_ROWS = [
 	'MixedTagTests.runsInStudio:passed',
 	'ServerTests.runsFromServerScriptService:passed',
 	'ServerTests.sharesModuleIdentity:passed',
+	'SlowTests.quickCheck:passed',
 	// A @Tag("Studio") class belongs in Studio; this fixture's test throws by
 	// design (it guards the Lune profile), so here it simply reports a failure.
 	'TaggedTests.needsEngine:failed',
 ];
-const SELECTED_ROWS = ['MixedTagTests.runsInStudio:passed', 'ServerTests.runsFromServerScriptService:passed'];
+const SELECTED_ROWS = [
+	'MixedTagTests.runsInStudio:passed',
+	'ServerTests.runsFromServerScriptService:passed',
+	'SlowOnlyTests.sweepAll:passed',
+];
 
 function assertNoLuneTestRan(output) {
 	assert.ok(!output.includes('must never run in Roblox Studio'), `a Lune-tagged test ran in Studio:\n${output}`);
@@ -68,18 +82,19 @@ function assertNoLuneTestRan(output) {
 
 module.exports = function runStudioTagChecks(scriptDir) {
 	const scenarios = [
-		['bootstrap', 'bootstrap-all.luau', buildStudioBootstrapScript(), RUN_ALL_ROWS],
-		['bootstrap', 'bootstrap-selected.luau', buildStudioBootstrapScript(SELECTION), SELECTED_ROWS],
-		['job', 'job-all.luau', buildLiveSyncJobScript(), RUN_ALL_ROWS],
-		['job', 'job-selected.luau', buildLiveSyncJobScript({ selection: SELECTION }), SELECTED_ROWS],
+		['bootstrap', 'bootstrap-all.luau', buildStudioBootstrapScript(undefined, SLOW_ALL), RUN_ALL_ROWS, 4],
+		['bootstrap', 'bootstrap-selected.luau', buildStudioBootstrapScript(SELECTION, SLOW_SELECTED), SELECTED_ROWS, 1],
+		['job', 'job-all.luau', buildLiveSyncJobScript({ slow: SLOW_ALL }), RUN_ALL_ROWS, 4],
+		['job', 'job-selected.luau', buildLiveSyncJobScript({ selection: SELECTION, slow: SLOW_SELECTED }), SELECTED_ROWS, 1],
 	];
-	for (const [kind, name, code, expected] of scenarios) {
+	for (const [kind, name, code, expected, slowLeftOut] of scenarios) {
 		const { output, rows } = run(scriptDir, kind, name, code);
 		assert.deepStrictEqual(rows, expected, `${name}: unexpected results:\n${output}`);
 		assertNoLuneTestRan(output);
 		// LuneOnlyTests (source) and MetadataOnlyTests (metadata) are left out as
 		// classes; runsOnlyUnderLune as a single method.
 		assert.match(output, /left out 2 Lune-tagged test class\(es\) and 1 Lune-tagged test\(s\)/, `${name}:\n${output}`);
+		assert.match(output, new RegExp(`Left out ${slowLeftOut} slow test\\(s\\)`), `${name}:\n${output}`);
 		if (kind === 'job') {
 			assert.ok(!output.includes('[lunit] ERROR:'), `${name}:\n${output}`);
 		}

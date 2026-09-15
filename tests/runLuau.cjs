@@ -20,6 +20,7 @@ try {
   process.exitCode = selection.status ?? 1;
  }
  if (process.exitCode === 0) {
+  require('./slowFilter.cjs')(dir);
   require('./luneGame.cjs')(dir);
   require('./studioTags.cjs')(dir);
  }

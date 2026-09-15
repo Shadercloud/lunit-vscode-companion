@@ -6,7 +6,7 @@ import { buildStudioBootstrapScript } from './bootstrapTemplate';
 import { LunitConfig } from './config';
 import { LiveSyncBridge } from './liveSyncBridge';
 import { buildLiveSyncJobScript } from './liveSyncScriptTemplate';
-import { TestSelection } from './luauTestFilterTemplate';
+import { SlowTestFilter, TestSelection } from './luauTestFilterTemplate';
 import { RunOutcome } from './luneRunner';
 import { runCommand } from './processRunner';
 import { parseResultLines } from './resultProtocol';
@@ -272,6 +272,7 @@ function readPackageName(cwd: string): string {
 export function regenerateStudioFiles(
 	config: LunitConfig,
 	selection?: TestSelection,
+	slow?: SlowTestFilter,
 ): { projectFile: string; bootstrapScript: string } {
 	const cwd = config.workspaceRoot;
 	const projectFile = config.studio.projectFile;
@@ -297,7 +298,7 @@ export function regenerateStudioFiles(
 	fs.writeFileSync(projectFile, projectContent, 'utf8');
 
 	fs.mkdirSync(path.dirname(config.studio.bootstrapScript), { recursive: true });
-	fs.writeFileSync(config.studio.bootstrapScript, buildStudioBootstrapScript(selection), 'utf8');
+	fs.writeFileSync(config.studio.bootstrapScript, buildStudioBootstrapScript(selection, slow), 'utf8');
 
 	return { projectFile, bootstrapScript: config.studio.bootstrapScript };
 }
@@ -316,6 +317,7 @@ async function runViaLiveSync(
 	token: CancelSignal,
 	onOutput: (chunk: string) => void,
 	selection: TestSelection | undefined,
+	slow: SlowTestFilter | undefined,
 ): Promise<RunOutcome> {
 	onOutput(
 		'[lunit] an already-open, Rojo-synced Roblox Studio instance was detected (Lunit Studio plugin connected) -- running tests there directly instead of launching a new Studio process.\n',
@@ -355,7 +357,7 @@ async function runViaLiveSync(
 
 	try {
 		const output = await bridge.runJob(
-			buildLiveSyncJobScript({ selection, deadlineSeconds: config.studio.liveSync.timeoutSeconds }),
+			buildLiveSyncJobScript({ selection, slow, deadlineSeconds: config.studio.liveSync.timeoutSeconds }),
 			config.studio.liveSync.timeoutSeconds * 1000,
 			token,
 		);
@@ -380,7 +382,7 @@ async function runViaLiveSync(
  * Studio plugin and `lunit.studio.liveSync.enabled` is true, delegates to
  * the faster live-sync path (runViaLiveSync) instead -- see there.
  *
- * Both paths leave out @Tag("Lune") tests; `selection`, when given, narrows
+ * Both paths leave out @Tag("Lune") tests and the slow tests `slow` names; `selection`, when given, narrows
  * the run to the classes/methods of an explicit request.
  */
 export async function runViaStudio(
@@ -389,13 +391,14 @@ export async function runViaStudio(
 	onOutput: (chunk: string) => void,
 	bridge?: LiveSyncBridge,
 	selection?: TestSelection,
+	slow?: SlowTestFilter,
 ): Promise<RunOutcome> {
 	const cwd = config.workspaceRoot;
 	const studio = config.studio;
 
 	if (bridge && config.studio.liveSync.enabled && bridge.isPluginConnected) {
 		if (hasRojoProjectFile(cwd)) {
-			return runViaLiveSync(config, bridge, token, onOutput, selection);
+			return runViaLiveSync(config, bridge, token, onOutput, selection, slow);
 		}
 		onOutput(
 			'[lunit] the Lunit Studio plugin is connected, but this project has no Rojo project file of its own (e.g. default.project.json) -- there\'s nothing here for "rojo serve" to serve, so the connected Studio instance is presumably showing some other project (or nothing). Building a standalone place and launching a new Studio process instead.\n',
@@ -425,7 +428,7 @@ export async function runViaStudio(
 		return { code: null, output: message, timedOut: false, cancelled: false };
 	}
 
-	regenerateStudioFiles(config, selection);
+	regenerateStudioFiles(config, selection, slow);
 
 	await fs.promises.mkdir(path.dirname(studio.placeFile), { recursive: true });
 	onOutput(`> ${studio.buildPlaceCommand}\n`);
