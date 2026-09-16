@@ -109,6 +109,14 @@ ${cliCommand(cliLauncherPath, '--studio')}
 - Tests tagged with one of the project's \`lunit.lune.slowTags\` (e.g.
   \`@Tag("Slow")\` long sweeps) are left out of \`--lune\` and \`--studio\`, and
   the summary says how many; add \`--full\` to run them too.
+- \`--lune\` runs each test module in its own Lune process, several at a
+  time (\`--workers N\` limits it; \`--workers 1\` runs them one by one).
+  Workers share no module cache or mutable state: a module that needs
+  another module to have run first must be listed with it, prerequisite
+  first, in \`lunit.lune.parallel.dependencyGroups\`. A class whose methods
+  and \`@Each\` rows are fully independent (no \`@BeforeAll\`/\`@AfterAll\`, no
+  \`@Order\`) may add a class-level \`@Tag("Parallel")\` to run each method
+  and row in its own process; \`@BeforeEach\`/\`@AfterEach\` still run per case.
 - Add one or more filters to run a subset, e.g. \`... --studio MyFeature\`
   or \`... --studio src/foo.test.ts\` -- case-insensitive substrings matched
   against each test's file path, class name, method name and display name.

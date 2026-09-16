@@ -3,8 +3,8 @@
  * terminal) use to run this project's Lunit tests, since nothing outside VS
  * Code can press the Test Explorer's own Run button.
  *
- *   node <launcher> [--studio | --lune [--full]] [--json] [--port N] [--workspace DIR]
- *                   [--standalone] [filter ...]
+ *   node <launcher> [--studio | --lune [--full] [--workers N]] [--json] [--port N]
+ *                   [--workspace DIR] [--standalone] [filter ...]
  *
  * Two ways it can execute, tried in order:
  *
@@ -38,18 +38,20 @@ import { discoverBridges, matchingBridges } from './bridgeDiscovery';
 import { parseTestFile } from './discovery';
 import { CliRunRequest, LiveSyncBridge } from './liveSyncBridge';
 import { buildTestSelection } from './luauTestFilterTemplate';
-import { RunOutcome, runViaLune } from './luneRunner';
+import { LuneRunOutcome, RunOutcome, runViaLune } from './luneRunner';
 import { createResultLineFilter, parseResultLines } from './resultProtocol';
 import { partitionSlowTests, slowTestFilterFor } from './runProfiles';
 import {
 	buildSummary,
 	formatSummary,
 	matchesFilters,
+	resolveBlockVerdict,
 	resolveVerdict,
 	RunSummary,
 	runsUnder,
 	RunVia,
 	SUMMARY_MARKER,
+	summarizeReport,
 	summaryFailed,
 	TestIdentity,
 	TestResultEntry,
@@ -60,6 +62,8 @@ interface CliArgs {
 	via: RunVia;
 	/** "Run with Lune (Full)": slow-tagged tests run too. Implies --lune. */
 	full: boolean;
+	/** Lune only: overrides lunit.lune.parallel.workers for this run. */
+	workers?: number;
 	json: boolean;
 	port?: number;
 	workspace?: string;
@@ -79,6 +83,8 @@ Options:
                     tagged with one of lunit.lune.slowTags.
   --full            Run with Lune including slow-tagged tests -- same as "Run with Lune (Full)".
                     Implies --lune.
+  --workers <n>     Lune only: run at most n Lune processes at once for this run (default:
+                    lunit.lune.parallel.workers, or min(32, CPU count)). 1 runs blocks one by one.
   --json            Print the run summary as JSON on stdout (live output goes to stderr).
   --port <n>        Select an exact window port (otherwise discover from lunit.studio.liveSync.port or ${DEFAULT_LIVE_SYNC_PORT}).
   --workspace <dir> Workspace folder to use when running standalone (default: nearest
@@ -119,6 +125,15 @@ function parseArgs(argv: string[]): CliArgs {
 			case '--full':
 				args.full = true;
 				break;
+			case '--workers': {
+				const value = takeValue();
+				const workers = Number(value);
+				if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(workers)) {
+					throw new Error('--workers must be a positive integer');
+				}
+				args.workers = workers;
+				break;
+			}
 			case '--json':
 				args.json = true;
 				break;
@@ -152,6 +167,9 @@ function parseArgs(argv: string[]): CliArgs {
 			throw new Error('--full runs the Lune profile; it cannot be combined with --studio');
 		}
 		args.via = 'lune';
+	}
+	if (args.workers !== undefined && args.via !== 'lune') {
+		throw new Error('--workers applies to the Lune profile; add --lune (or --full)');
 	}
 	return args;
 }
@@ -523,11 +541,15 @@ async function runStandalone(
 
 	const displayFilter = createResultLineFilter(onOutput);
 	const chunkSink = (chunk: string) => displayFilter.feed(chunk);
-	let outcome: RunOutcome;
+	let outcome: LuneRunOutcome | RunOutcome;
 	try {
 		outcome =
 			args.via === 'lune'
-				? await runViaLune(config, cancel.token, chunkSink, slowFilter)
+				? await runViaLune(config, cancel.token, chunkSink, {
+						slow: slowFilter,
+						selection: args.filters.length > 0 ? leaves : undefined,
+						workers: args.workers,
+					})
 				: await runViaStudio(
 						config,
 						cancel.token,
@@ -546,6 +568,31 @@ async function runStandalone(
 	}
 	displayFilter.flush();
 
+	const report = 'report' in outcome ? outcome.report : undefined;
+	if (report) {
+		// A dependency group may have run prerequisite modules beyond the
+		// filter: report those too, so nothing that ran goes unmentioned.
+		const covered = new Set(leaves.map((leaf) => `${leaf.className}\u0000${leaf.methodName}`));
+		const extras = all.filter((leaf) => {
+			const key = `${leaf.className}\u0000${leaf.methodName}`;
+			if (covered.has(key)) {
+				return false;
+			}
+			const mentioned = report.blocks.some((block) =>
+				block.tests.some((test) => test.className === leaf.className && test.methodName === leaf.methodName),
+			);
+			if (mentioned) {
+				covered.add(key);
+			}
+			return mentioned;
+		});
+		const results: TestResultEntry[] = [...leaves, ...extras].map((leaf) => ({
+			...identityOnly(leaf),
+			...resolveBlockVerdict(leaf, report),
+		}));
+		const summary = withSlowCount(buildSummary(args.via, results, outcome.cancelled));
+		return report.blocks.length > 0 ? { ...summary, lune: summarizeReport(report) } : summary;
+	}
 	if (outcome.cancelled) {
 		return withSlowCount(buildSummary(args.via, leaves.map((leaf) => ({ ...identityOnly(leaf), status: 'skipped' })), true));
 	}
@@ -614,7 +661,13 @@ async function main(): Promise<number> {
 		// Preserve legacy extensions and explicit --port. Never send a run to
 		// a discovered modern window that belongs to an unrelated workspace.
 		const result: ExtensionRunResult = target || args.port !== undefined || discovered.length === 0
-			? await runThroughExtension(target?.port ?? port, { cwd: args.workspace ?? cwd, via: args.via, filters: args.filters, full: args.full }, live, cancel, target?.instanceId)
+			? await runThroughExtension(
+					target?.port ?? port,
+					{ cwd: args.workspace ?? cwd, via: args.via, filters: args.filters, full: args.full, workers: args.workers },
+					live,
+					cancel,
+					target?.instanceId,
+				)
 			: { kind: 'not-listening' };
 		if (result.kind === 'done') {
 			summary = result.summary;

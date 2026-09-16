@@ -81,6 +81,8 @@ local function lunitRunClass(lunit, cls, className)
 		local status = testResult.skipped and "skipped" or (testResult.passed and "passed" or "failed")
 		lunitEmitResult(className, testResult.label, status, testResult.elapsedTimeMs, testResult.errorMessage)
 	end
-	return result.numTestsFailed > 0
+	-- The run result comes second so a caller that wants counts (the Lune
+	-- block worker) has them; the Studio scripts only read the boolean.
+	return result.numTestsFailed > 0, result
 end`;
 }

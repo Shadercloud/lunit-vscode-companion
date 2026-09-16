@@ -12,6 +12,8 @@ export interface CliRunRequest {
 	filters: string[];
 	/** With `via: 'lune'`, "Run with Lune (Full)": include slow-tagged tests. */
 	full?: boolean;
+	/** With `via: 'lune'`, overrides `lunit.lune.parallel.workers` for this run. */
+	workers?: number;
 }
 
 /**
@@ -263,7 +265,13 @@ export class LiveSyncBridge {
 				if (typeof parsed.cwd !== 'string' || (parsed.via !== 'lune' && parsed.via !== 'studio')) {
 					throw new Error('missing cwd/via');
 				}
-				request = { cwd: parsed.cwd, via: parsed.via, filters: Array.isArray(parsed.filters) ? parsed.filters.map(String) : [], full: parsed.full === true };
+				request = {
+					cwd: parsed.cwd,
+					via: parsed.via,
+					filters: Array.isArray(parsed.filters) ? parsed.filters.map(String) : [],
+					full: parsed.full === true,
+					workers: typeof parsed.workers === 'number' && Number.isInteger(parsed.workers) && parsed.workers > 0 ? parsed.workers : undefined,
+				};
 			} catch {
 				res.statusCode = 400;
 				res.end('Malformed /run request body.');

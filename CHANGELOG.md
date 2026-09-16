@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.7.0
+
+### Added
+
+- **Parallel Lune runs.** **Run with Lune** and **Run with Lune (Full)** now run tests in a bounded pool
+  of independent Lune processes instead of one. The project is compiled once, one discovery process
+  lists every test module's compiled Lunit metadata, and the run is split into *blocks*: one test module
+  per block by default, which keeps each class's method ordering, lifecycle hooks and shared state
+  exactly as before. A freed worker takes the next pending block at once. Default worker count:
+  min(32, logical CPUs), capped by the number of blocks; `lunit.lune.parallel.workers` sets it
+  (`64` is allowed) and the command line takes `--workers N` for one run. `--workers 1` runs the blocks
+  one after another, still isolated.
+  - A class-level **`@Tag("Parallel")`** opts a class into one block per test method and per `@Each`
+    row, each in a fresh Lune VM and class instance with its own `@BeforeEach`/`@AfterEach`. A class
+    with `@BeforeAll`/`@AfterAll`, `@Order`, or a method that is both a test and a hook is rejected:
+    its tests are reported as errored with the reason, and the run output says so.
+  - **`lunit.lune.parallel.dependencyGroups`** names modules that must share one Lune process in
+    prerequisite-first order; a group takes precedence over `@Tag("Parallel")`. Selecting a test in a
+    group runs the modules before its module in full, and the output explains the extra execution.
+    Unknown, ambiguous or repeated names stop the run with an error before anything is scheduled.
+  - The Test Explorer reports queued, running, passed, failed, skipped and errored states as blocks
+    finish. A parameterized method's rows are folded onto its item: any failing row fails it and the
+    message names the row. Selecting the method runs every one of its rows.
+  - Worker output streams to the Lunit output channel prefixed with its block id (`[#12]`), with a
+    `started` and `PASS`/`FAIL`/`ERROR` line per block, then a closing summary: block and worker
+    counts, wall time (compile and discovery separately), the longest block, and the blocks over
+    10 s (an optimization target, never a timeout).
+  - A worker that crashes, is killed, reports no block summary, or reports a summary that disagrees
+    with its result lines errors every test of that block. A test no block reported is errored, never
+    passed by omission. Cancelling stops the running workers (whole process trees), starts nothing
+    else, and reports the rest as not run.
+  - Generated scripts and job files live in a per-run directory, so concurrent runs never overwrite
+    each other's files.
+  - **`lunit.lune.parallel.enabled: false`** restores the previous behaviour: every module in one Lune
+    process with one shared module cache.
+- The command line gets `--workers <n>` (Lune only) and reports the block, worker and wall-time
+  figures in its summary (`lune` in `--json`).
+
+### Changed
+
+- The Lune profile runs only the selected tests (and their dependency prerequisites) rather than the
+  whole suite, and a test whose compiled module failed to load is errored with the load error. Slow
+  tests and Studio-tagged tests are left out by the planner, from the compiled metadata, rather than
+  inside the Lune script. "Run in Roblox Studio" is unchanged.
+
 ## 0.6.0
 
 ### Added

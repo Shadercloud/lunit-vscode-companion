@@ -1,63 +1,43 @@
-// Regression coverage for the "Run with Lune" game-project path: generates the
-// virtual DataModel and the game runner exactly as luneRunner.ts does, then
-// runs them against tests/fixtures/game -- a roblox-ts --type game layout with
-// tests in ReplicatedStorage, ServerScriptService and StarterPlayerScripts.
+// Regression coverage for the "Run with Lune" game-project path: runs the
+// real runner (luneRunner.ts, generating the virtual DataModel and the game
+// worker) against tests/fixtures/game -- a roblox-ts --type game layout with
+// tests in ReplicatedStorage, ServerScriptService and StarterPlayerScripts --
+// through the parallel block scheduler.
 //
-// Driven from runLuau.cjs because it needs Lune on PATH.
+// Driven from runLuau.cjs because it needs Lune on PATH (or LUNE_EXE).
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
-const { buildRojoDataModelModule } = require('../out/rojoDataModelTemplate');
-const { buildLuneGameRunnerScript } = require('../out/luneGameScriptTemplate');
+const { runViaLune } = require('../out/luneRunner');
+const { buildConfig } = require('../out/config');
+const { CancelSource } = require('../out/cancelSignal');
+const { resolveBlockVerdict } = require('../out/runReport');
 const { detectLuneProject, detectOutputKind } = require('../out/luneProjectKind');
 const { buildTestSelection } = require('../out/luauTestFilterTemplate');
 
 const FIXTURE = path.join(__dirname, 'fixtures', 'game');
+const LUNE = process.env.LUNE_EXE ? `"${process.env.LUNE_EXE}"` : 'lune';
 
-function decodeResults(output) {
-	const rows = [];
-	for (const line of output.split(/\r?\n/)) {
-		const marker = line.indexOf('@@LUNIT_RESULT@@');
-		if (marker === -1) {
-			continue;
-		}
-		const [cls, label, status] = line.slice(marker + '@@LUNIT_RESULT@@'.length).split('\t');
-		rows.push({
-			cls: Buffer.from(cls, 'base64').toString('utf8'),
-			label: Buffer.from(label, 'base64').toString('utf8'),
-			status,
-		});
-	}
-	return rows;
+function config(storageDir, settings = {}) {
+	const all = { skipCompile: true, 'lune.executable': LUNE, 'lune.projectFile': 'game.project.json', ...settings };
+	return buildConfig(FIXTURE, storageDir, (key, fallback) => (key in all ? all[key] : fallback));
 }
 
-function countByClass(rows) {
-	const byClass = {};
-	for (const row of rows) {
-		byClass[row.cls] = (byClass[row.cls] || 0) + 1;
-	}
-	return byClass;
+async function run(storageDir, settings, options = {}) {
+	let output = '';
+	const outcome = await runViaLune(config(storageDir, settings), new CancelSource().token, (text) => (output += text), options);
+	assert.ok(outcome.report, `no report:\n${output}`);
+	return { outcome, output, report: outcome.report };
 }
 
-function run(scriptDir, projectFile, runnerName = 'lune-game-runner.luau', moduleFilter) {
-	const result = spawnSync(
-		process.env.LUNE_EXE || 'lune',
-		['run', path.join(scriptDir, runnerName), projectFile, ...(moduleFilter ? [moduleFilter] : [])],
-		{ cwd: FIXTURE, encoding: 'utf8' },
-	);
-	if (result.error) {
-		throw result.error;
-	}
-	return { code: result.status, output: `${result.stdout}${result.stderr}` };
-}
+const ident = (className, methodName, file = `/src/${className}.test.ts`) => ({ file, className, methodName });
+const status = (report, className, methodName) => resolveBlockVerdict(ident(className, methodName), report).status;
+const labels = (report) => report.blocks.map((block) => block.label).sort();
+const SLOW = { tags: ['Slow'] };
 
-module.exports = function runGameProjectChecks(scriptDir) {
-	fs.writeFileSync(path.join(scriptDir, 'lune-rbx.luau'), buildRojoDataModelModule());
-	fs.writeFileSync(
-		path.join(scriptDir, 'lune-game-runner.luau'),
-		buildLuneGameRunnerScript('./lune-rbx'),
-	);
+module.exports = async function runGameProjectChecks(scriptDir) {
+	const storageDir = path.join(scriptDir, 'game-storage');
+	fs.mkdirSync(storageDir, { recursive: true });
 
 	// Detection: the fixture's compiled output resolves through the DataModel.
 	assert.strictEqual(detectOutputKind(path.join(FIXTURE, 'out')), 'game');
@@ -93,77 +73,92 @@ module.exports = function runGameProjectChecks(scriptDir) {
 	assert.strictEqual(packageLike.kind, 'package');
 	assert.strictEqual(packageLike.blocked, undefined);
 
-	// No slow filter: "Run with Lune (Full)", or a project without slowTags.
-	const passing = run(scriptDir, 'game.project.json');
-	const rows = decodeResults(passing.output);
+	// "Run with Lune" with lunit.lune.slowTags = ["Slow"]: one block per
+	// module, the Parallel class split per case, Studio-tagged classes and
+	// tests left out, slow tests left out and counted.
+	const everyday = await run(storageDir, {}, { slow: SLOW });
 	assert.deepStrictEqual(
-		countByClass(rows),
-		{ DatatypeTests: 6, ServerTests: 2, ClientTests: 2, SlowTests: 3, SlowOnlyTests: 2 },
-		`unexpected results:\n${passing.output}`,
-	);
-	assert.ok(!passing.output.includes('slow test(s)'), passing.output);
-	assert.ok(
-		rows.every((row) => row.status === 'passed'),
-		`a fixture test failed:\n${passing.output}`,
-	);
-	assert.ok(
-		!passing.output.includes('must never'),
-		`a Studio-tagged test or module ran:\n${passing.output}`,
-	);
-	assert.match(passing.output, /Left out 2 Studio-tagged test class\(es\) and 1 Studio-tagged test\(s\)/);
-	assert.strictEqual(passing.code, 0, passing.output);
-
-	// "Run with Lune" with lunit.lune.slowTags = ["Slow"]: class- and method-level
-	// slow tests are left out and counted, never reported.
-	fs.writeFileSync(
-		path.join(scriptDir, 'lune-game-runner-slow.luau'),
-		buildLuneGameRunnerScript('./lune-rbx', { tags: ['Slow'] }),
-	);
-	const everyday = run(scriptDir, 'game.project.json', 'lune-game-runner-slow.luau');
-	const everydayRows = decodeResults(everyday.output);
-	assert.deepStrictEqual(
-		countByClass(everydayRows),
-		{ DatatypeTests: 6, ServerTests: 2, ClientTests: 2, SlowTests: 1 },
-		`slow tests must be left out:\n${everyday.output}`,
-	);
-	assert.ok(
-		everydayRows.some((row) => row.cls === 'SlowTests' && row.label === 'quickCheck' && row.status === 'passed'),
+		labels(everyday.report),
+		[
+			'ReplicatedStorage.Shared.datatypes.test',
+			'ReplicatedStorage.Shared.parallelRows.test::plain',
+			'ReplicatedStorage.Shared.parallelRows.test::rows[1]',
+			'ReplicatedStorage.Shared.parallelRows.test::rows[2]',
+			'ReplicatedStorage.Shared.parallelRows.test::rows[3]',
+			'ServerScriptService.Server.group.consumer.test',
+			'ServerScriptService.Server.group.setup.test',
+			'ServerScriptService.Server.server.test',
+			'ServerScriptService.Server.slow.test',
+			'StarterPlayer.StarterPlayerScripts.Client.client.test',
+		],
 		everyday.output,
 	);
-	assert.match(everyday.output, /Left out 4 slow test\(s\): run with Lune \(Full\)\./);
-	assert.strictEqual(everyday.code, 0, everyday.output);
+	for (const name of ['absoluteImports', 'relativeImports', 'datatypeIdentity', 'datatypePrecision', 'jsonModules', 'ignoredPaths']) {
+		assert.strictEqual(status(everyday.report, 'DatatypeTests', name), 'passed', `${name}:\n${everyday.output}`);
+	}
+	assert.strictEqual(status(everyday.report, 'DatatypeTests', 'needsEngine'), 'skipped', 'method-level Studio tag');
+	assert.strictEqual(status(everyday.report, 'TaggedTests', 'needsEngine'), 'skipped', 'class-level Studio tag in the metadata');
+	assert.strictEqual(status(everyday.report, 'ServerTests', 'runsFromServerScriptService'), 'passed', everyday.output);
+	assert.strictEqual(status(everyday.report, 'ServerTests', 'sharesModuleIdentity'), 'passed', everyday.output);
+	assert.strictEqual(status(everyday.report, 'ClientTests', 'runsFromStarterPlayerScripts'), 'passed', everyday.output);
+	assert.strictEqual(status(everyday.report, 'ClientTests', 'unmappedServicesAreStubs'), 'passed', everyday.output);
+	assert.strictEqual(status(everyday.report, 'SlowTests', 'quickCheck'), 'passed', everyday.output);
+	assert.strictEqual(status(everyday.report, 'SlowTests', 'sweep'), 'skipped');
+	assert.strictEqual(status(everyday.report, 'SlowTests', 'longSweep'), 'skipped');
+	assert.strictEqual(status(everyday.report, 'SlowOnlyTests', 'sweepAll'), 'skipped');
+	assert.strictEqual(status(everyday.report, 'ParallelRowTests', 'plain'), 'passed', everyday.output);
+	const rows = resolveBlockVerdict(ident('ParallelRowTests', 'rows'), everyday.report);
+	assert.strictEqual(rows.status, 'failed', everyday.output);
+	assert.match(rows.message, /^rows \(2, 2, 5\): .*2 \+ 2 should be 5/);
+	assert.strictEqual(status(everyday.report, 'ParallelRowTests', 'sweep'), 'skipped');
+	assert.strictEqual(status(everyday.report, 'SetupTests', 'registersTheFixture'), 'passed', everyday.output);
+	assert.strictEqual(status(everyday.report, 'ConsumerTests', 'seesTheFixture'), 'failed', 'a fresh VM without the group');
+	assert.strictEqual(everyday.report.excludedClasses, 2, 'the source-tagged module and the metadata-tagged class');
+	assert.strictEqual(everyday.report.excludedTests, 1);
+	assert.strictEqual(everyday.report.slowLeftOut, 5);
+	assert.match(everyday.output, /Left out 2 Studio-tagged test class\(es\) and 1 Studio-tagged test\(s\): run them with the Studio profile\./);
+	assert.ok(!everyday.output.includes('must never'), `a Studio-tagged test or module ran:\n${everyday.output}`);
+	assert.ok(!everyday.output.includes('lifecycle hook was removed'), everyday.output);
+
+	// "Run with Lune (Full)": slow tests run too.
+	const full = await run(storageDir, {});
+	assert.strictEqual(full.report.slowLeftOut, 0);
+	for (const [cls, name] of [['SlowTests', 'sweep'], ['SlowTests', 'longSweep'], ['SlowOnlyTests', 'sweepAll'], ['SlowOnlyTests', 'sweepAgain'], ['ParallelRowTests', 'sweep']]) {
+		assert.strictEqual(status(full.report, cls, name), 'passed', `${cls}.${name}:\n${full.output}`);
+	}
+	assert.ok(!full.output.includes('slow test'), full.output);
 
 	// A class whose only tests are slow is "left out", not "no tests found".
-	const onlySlow = run(scriptDir, 'game.project.json', 'lune-game-runner-slow.luau', 'slowOnly');
-	assert.deepStrictEqual(decodeResults(onlySlow.output), [], onlySlow.output);
-	assert.match(onlySlow.output, /Left out 2 slow test\(s\)/);
+	const onlySlow = await run(storageDir, {}, { slow: SLOW, selection: [ident('SlowOnlyTests', 'sweepAll'), ident('SlowOnlyTests', 'sweepAgain')] });
+	assert.deepStrictEqual(onlySlow.report.blocks, []);
+	assert.match(onlySlow.output, /nothing to run under this profile: 2 slow test\(s\) left out/);
 	assert.ok(!/No tests found|Every discovered test/.test(onlySlow.output), onlySlow.output);
-	assert.strictEqual(onlySlow.code, 0, onlySlow.output);
+	assert.strictEqual(onlySlow.outcome.code, 0);
 
 	// An explicitly selected slow test runs anyway; its class's other slow test does not.
-	fs.writeFileSync(
-		path.join(scriptDir, 'lune-game-runner-explicit.luau'),
-		buildLuneGameRunnerScript('./lune-rbx', {
-			tags: ['Slow'],
-			allowed: buildTestSelection([{ file: 'slowOnly.test.ts', className: 'SlowOnlyTests', methodName: 'sweepAll' }]),
-		}),
-	);
-	const explicit = run(scriptDir, 'game.project.json', 'lune-game-runner-explicit.luau');
-	const explicitRows = decodeResults(explicit.output).filter((row) => row.cls.startsWith('Slow'));
-	assert.deepStrictEqual(
-		explicitRows.map((row) => `${row.cls}.${row.label}:${row.status}`).sort(),
-		['SlowOnlyTests.sweepAll:passed', 'SlowTests.quickCheck:passed'],
-		explicit.output,
-	);
-	assert.match(explicit.output, /Left out 3 slow test\(s\)/);
+	const explicit = await run(storageDir, {}, {
+		slow: { tags: ['Slow'], allowed: buildTestSelection([ident('SlowOnlyTests', 'sweepAll')]) },
+		selection: [ident('SlowOnlyTests', 'sweepAll')],
+	});
+	assert.deepStrictEqual(labels(explicit.report), ['ServerScriptService.Server.slowOnly.test']);
+	assert.deepStrictEqual(explicit.report.blocks[0].tests.map((test) => test.methodName), ['sweepAll']);
+	assert.strictEqual(status(explicit.report, 'SlowOnlyTests', 'sweepAll'), 'passed', explicit.output);
 
-	const broken = run(scriptDir, 'broken.project.json');
+	// A dependency group named by full name and by a trailing part.
+	const grouped = await run(storageDir, { 'lune.parallel.dependencyGroups': [['ServerScriptService.Server.group.setup.test', 'group/consumer.test']] }, { slow: SLOW });
+	assert.ok(labels(grouped.report).includes('ServerScriptService.Server.group.setup.test -> ServerScriptService.Server.group.consumer.test'), grouped.output);
+	assert.strictEqual(status(grouped.report, 'ConsumerTests', 'seesTheFixture'), 'passed', grouped.output);
+
+	// A module whose dependency errors at load names the chain that reached it.
+	const broken = await run(storageDir, { 'lune.projectFile': 'broken.project.json' }, { slow: SLOW, selection: [ident('Broken', 'anything', '/src/broken.test.ts')] });
 	assert.match(
 		broken.output,
 		/failed to load test module ReplicatedStorage\.Broken\.broken\.test: ReplicatedStorage\.Broken\.broken\.test: ReplicatedStorage\.Broken\.missingDep: .*dependency blew up on purpose/,
 		`a load failure must name the dependency chain:\n${broken.output}`,
 	);
-	assert.strictEqual(broken.code, 1, 'a load failure must fail the run');
+	const brokenVerdict = resolveBlockVerdict(ident('Broken', 'anything', '/src/broken.test.ts'), broken.report);
+	assert.strictEqual(brokenVerdict.status, 'errored');
+	assert.match(brokenVerdict.message, /ReplicatedStorage\.Broken\.broken\.test failed to load: .*dependency blew up on purpose/);
 
 	console.log('Lune game-project regression checks passed');
 };

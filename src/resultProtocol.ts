@@ -13,9 +13,18 @@
 export const RESULT_MARKER = '@@LUNIT_RESULT@@';
 
 /**
+ * Lines meant for machines, not people: the per-test result lines here, and
+ * the module listing / block summary lines of a parallel Lune run
+ * (luneBlockProtocol.ts). Written out literally rather than imported so this
+ * module stays free of a dependency cycle.
+ */
+const HIDDEN_LINE = /@@LUNIT_(RESULT|MODULES|BLOCK)@@/;
+
+/**
  * Wraps a "display this line" sink so `@@LUNIT_RESULT@@...` protocol lines
- * (base64-encoded, meant for `parseResultLines` above, not humans) never
- * reach it -- while everything else still streams through untouched. Chunks
+ * (base64-encoded, meant for `parseResultLines` above, not humans) and the
+ * other machine-only lines never reach it -- while everything else still
+ * streams through untouched. Chunks
  * from `onOutput` can split mid-line, so this buffers until it sees a full
  * line before deciding whether to forward or drop it; call `flush()` once
  * the run is done to emit anything left over (e.g. a final line with no
@@ -34,13 +43,13 @@ export function createResultLineFilter(sink: (text: string) => void): {
 		const lastComplete = /\r?\n$/.test(last);
 		buffer = lastComplete ? '' : (pieces.pop() ?? '');
 		for (const piece of pieces) {
-			if (!piece.includes(RESULT_MARKER)) {
+			if (!HIDDEN_LINE.test(piece)) {
 				sink(piece);
 			}
 		}
 	};
 	const flush = (): void => {
-		if (buffer.length > 0 && !buffer.includes(RESULT_MARKER)) {
+		if (buffer.length > 0 && !HIDDEN_LINE.test(buffer)) {
 			sink(buffer);
 		}
 		buffer = '';

@@ -2,7 +2,7 @@
   "name": "vscode-lunit-companion",
   "displayName": "Lunit Test Companion",
   "description": "Discover and run @rbxts/lunit tests from VS Code's Test Explorer.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "ShaderCloud",
   "author": "ShaderCloud",
   "license": "MIT",
@@ -125,6 +125,29 @@
           },
           "default": [],
           "markdownDescription": "Tags marking slow tests (matched case-insensitively, on the class or the method), e.g. `[\"Slow\"]`. **Run with Lune** and **Run in Roblox Studio** leave these tests out, and the run report says how many, unless you run a single slow test directly. Setting any tag adds a **Run with Lune (Full)** profile that runs them too (`--full` on the command line)."
+        },
+        "lunit.lune.parallel.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Run Lune tests in a pool of independent Lune processes. Each test module is one block, run in its own process with its own module cache; a class-level `@Tag(\"Parallel\")` splits a module further into one block per test method and per `@Each` row, each in a fresh VM and class instance. Workers share no caches or mutable state, so a test that relies on another *module* having run first must be listed with it in `lunit.lune.parallel.dependencyGroups`. Turn this off to run every module in one Lune process, sharing one module cache, as before version 0.7.0."
+        },
+        "lunit.lune.parallel.workers": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "markdownDescription": "Maximum number of Lune processes running at once. `0` picks the smaller of 32 and the logical CPU count; the count is always capped by the number of blocks. `1` runs the blocks one after another, still isolated. Larger values such as `64` are allowed: concurrent VM start-ups and memory contend, so whether 64 beats 32 on a 64-core machine depends on the suite (measurements went both ways); measure before raising it. The command line accepts `--workers N` for one run."
+        },
+        "lunit.lune.parallel.dependencyGroups": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 2
+          },
+          "markdownDescription": "Test modules that depend on each other, as arrays of module names in prerequisite-first order, e.g. `[[\"setup.test\", \"consumer.test\"]]`. The modules of a group load into one Lune process and their classes run in that order; a group takes precedence over `@Tag(\"Parallel\")` case splitting. Name a module as the run output shows it (`out/tests/setup.test` for a package project, `ReplicatedStorage.Tests.setup.test` for a game project); a unique trailing part such as `setup.test` or `Tests/setup.test.ts` is enough. Selecting a test in a group also runs the modules listed before its module, in full, and the run output says so. Unknown, ambiguous or repeated names stop the run with an error. A module can belong to one group only."
         },
         "lunit.lune.executable": {
           "type": "string",

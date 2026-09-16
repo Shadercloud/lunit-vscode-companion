@@ -1,3 +1,5 @@
+import { BlockKind, BlockTest, LunePlan, moduleMatchesSource, TestRef, UnscheduledTest } from './luneBlocks';
+import { BlockStatus, BlockSummary, ModuleLoadFailure } from './luneBlockProtocol';
 import { RunOutcome } from './luneRunner';
 import { aggregateForLabel, ResultRecord } from './resultProtocol';
 
@@ -70,6 +72,239 @@ export function resolveVerdict(test: TestIdentity, records: readonly ResultRecor
 	return { status: 'errored', message: NO_MATCH_MESSAGE };
 }
 
+// ---------------------------------------------------------------------------
+// Parallel Lune runs: one report per run, one entry per block
+// ---------------------------------------------------------------------------
+
+export type BlockRunStatus = 'pending' | 'running' | BlockStatus;
+
+export interface BlockReport {
+	index: number;
+	kind: BlockKind;
+	label: string;
+	tests: BlockTest[];
+	status: BlockRunStatus;
+	/** Why the whole block is errored. */
+	error?: string;
+	records: ResultRecord[];
+	summary?: BlockSummary;
+	/** Modules of this block that failed to load, as the worker reported them. */
+	loadFailures: ModuleLoadFailure[];
+	seconds?: number;
+	exitCode?: number | null;
+}
+
+/**
+ * Everything a parallel Lune run knows about itself, updated in place as
+ * blocks finish so the Test Explorer can report progress and the summary can
+ * be printed at the end.
+ */
+export interface LuneRunReport {
+	blocks: BlockReport[];
+	unscheduled: UnscheduledTest[];
+	notes: string[];
+	workers: number;
+	/** `lunit.lune.parallel.enabled` false: everything in one Lune process. */
+	singleProcess: boolean;
+	compileSeconds: number;
+	discoverySeconds: number;
+	/** Set once the run is over. */
+	wallSeconds?: number;
+	/** A problem that stopped the run before or while scheduling; every test is errored with it. */
+	error?: string;
+	/** Modules the discovery step could not load; a test whose source matches one is errored with its reason. */
+	loadFailures: ModuleLoadFailure[];
+	/** Studio-tagged (or otherwise excluded) classes/tests the run left out, for the closing note. */
+	excludedClasses: number;
+	excludedTests: number;
+	slowLeftOut: number;
+	/** Blocks longer than this many seconds are listed at the end as optimization targets, never failed. */
+	longBlockSeconds: number;
+}
+
+export function createRunReport(
+	plan: LunePlan,
+	workers: number,
+	singleProcess: boolean,
+	loadFailures: ModuleLoadFailure[] = [],
+): LuneRunReport {
+	return {
+		loadFailures,
+		blocks: plan.blocks.map((block) => ({
+			index: block.index,
+			kind: block.kind,
+			label: block.label,
+			tests: block.tests,
+			status: 'pending',
+			records: [],
+			loadFailures: [],
+		})),
+		unscheduled: plan.unscheduled,
+		notes: plan.notes,
+		workers,
+		singleProcess,
+		compileSeconds: 0,
+		discoverySeconds: 0,
+		excludedClasses: plan.counts.excludedClasses,
+		excludedTests: plan.counts.excludedTests,
+		slowLeftOut: plan.counts.slowLeftOut,
+		longBlockSeconds: 10,
+	};
+}
+
+function testKey(test: TestRef): string {
+	return `${test.className}\u0000${test.methodName}`;
+}
+
+/** The blocks whose results a test depends on: one, or one per @Each row of a Parallel class. */
+export function blocksForTest(report: LuneRunReport, test: TestRef): BlockReport[] {
+	const key = testKey(test);
+	return report.blocks.filter((block) => block.tests.some((candidate) => testKey(candidate) === key));
+}
+
+export function isTerminalBlockStatus(status: BlockRunStatus): boolean {
+	return status === 'passed' || status === 'failed' || status === 'errored' || status === 'cancelled';
+}
+
+/**
+ * Resolves one test's verdict from a parallel run's report. Every problem
+ * is explicit: a block that crashed, was cancelled, never reported a result
+ * for the test, or could not be scheduled at all yields an error or a skip
+ * with the reason, never a pass by omission.
+ */
+export function resolveBlockVerdict(test: TestIdentity, report: LuneRunReport): Verdict {
+	const unscheduled = report.unscheduled.find((entry) => testKey(entry.test) === testKey(test));
+	if (unscheduled) {
+		return { status: unscheduled.status, message: unscheduled.reason };
+	}
+	if (report.error) {
+		return { status: 'errored', message: report.error };
+	}
+	const blocks = blocksForTest(report, test);
+	if (blocks.length === 0) {
+		const failure = report.loadFailures.find((entry) => moduleMatchesSource(test.file, entry.path));
+		if (failure) {
+			return { status: 'errored', message: `the compiled test module ${failure.path} failed to load: ${failure.error}` };
+		}
+		return {
+			status: 'errored',
+			message: `no compiled test class named "${test.className}" with a @Test method "${test.methodName}" was found in this Lune run. Is the project compiled, and does its module 'export =' the class?`,
+		};
+	}
+	const errored = blocks.find((block) => block.status === 'errored');
+	if (errored) {
+		return { status: 'errored', message: `block #${errored.index} (${errored.label}): ${errored.error ?? 'errored'}` };
+	}
+	for (const block of blocks) {
+		const membership = block.tests.find((candidate) => testKey(candidate) === testKey(test));
+		const loadFailure = membership && block.loadFailures.find((entry) => entry.path === membership.modulePath);
+		if (loadFailure) {
+			return { status: 'errored', message: `block #${block.index} (${block.label}): failed to load ${loadFailure.path}: ${loadFailure.error}` };
+		}
+	}
+	if (blocks.some((block) => !isTerminalBlockStatus(block.status) || block.status === 'cancelled')) {
+		return { status: 'skipped', message: 'the run was cancelled before this test finished' };
+	}
+	const records = blocks.flatMap((block) => block.records);
+	const match = aggregateForLabel(records, test.className, test.displayName ?? test.methodName);
+	if (match) {
+		if (match.status === 'passed') {
+			return { status: 'passed', elapsedMs: match.elapsedMs };
+		}
+		if (match.status === 'failed') {
+			return { status: 'failed', message: match.message ?? 'Test failed', elapsedMs: match.elapsedMs };
+		}
+		return { status: 'skipped', message: match.message };
+	}
+	const where = blocks.map((block) => `#${block.index} (${block.label}, exit code ${block.exitCode ?? '?'})`).join(', ');
+	return {
+		status: 'errored',
+		message: `block ${where} finished without reporting a result for this test. Its class name or @DisplayName at run time may differ from the source, or the worker stopped early; see the Lunit output for the block.`,
+	};
+}
+
+/** Tests of a just-finished block whose every block is now terminal, so their verdicts are final. */
+export function testsResolvedBy(report: LuneRunReport, block: BlockReport): TestRef[] {
+	const seen = new Set<string>();
+	const resolved: TestRef[] = [];
+	for (const test of block.tests) {
+		const key = testKey(test);
+		if (seen.has(key)) {
+			continue;
+		}
+		seen.add(key);
+		if (blocksForTest(report, test).every((other) => isTerminalBlockStatus(other.status))) {
+			resolved.push({ className: test.className, methodName: test.methodName });
+		}
+	}
+	return resolved;
+}
+
+export interface RunTimingSummary {
+	blocks: number;
+	workers: number;
+	wallSeconds: number;
+	passed: number;
+	failed: number;
+	errored: number;
+	cancelled: number;
+	longest?: { label: string; seconds: number };
+	/** Blocks over `report.longBlockSeconds`, longest first. */
+	long: { label: string; seconds: number }[];
+}
+
+export function summarizeReport(report: LuneRunReport): RunTimingSummary {
+	const timed = report.blocks
+		.filter((block): block is BlockReport & { seconds: number } => block.seconds !== undefined)
+		.map((block) => ({ label: `#${block.index} ${block.label}`, seconds: block.seconds }))
+		.sort((a, b) => b.seconds - a.seconds);
+	const count = (status: BlockRunStatus) => report.blocks.filter((block) => block.status === status).length;
+	return {
+		blocks: report.blocks.length,
+		workers: report.workers,
+		wallSeconds: report.wallSeconds ?? 0,
+		passed: count('passed'),
+		failed: count('failed'),
+		errored: count('errored'),
+		cancelled: count('cancelled') + count('pending') + count('running'),
+		longest: timed[0],
+		long: timed.filter((entry) => entry.seconds > report.longBlockSeconds),
+	};
+}
+
+/** The closing lines of a parallel Lune run, as printed to the output channel and the terminal. */
+export function formatReportSummary(report: LuneRunReport): string[] {
+	const summary = summarizeReport(report);
+	const seconds = (value: number) => `${value.toFixed(1)} s`;
+	const lines: string[] = [];
+	const parts = [`${summary.passed} passed`, `${summary.failed} failed`];
+	if (summary.errored > 0) {
+		parts.push(`${summary.errored} errored`);
+	}
+	if (summary.cancelled > 0) {
+		parts.push(`${summary.cancelled} not run`);
+	}
+	const how = report.singleProcess ? 'in one Lune process' : `on ${summary.workers} worker${summary.workers === 1 ? '' : 's'}`;
+	const phases = [`compile ${seconds(report.compileSeconds)}`, `discovery ${seconds(report.discoverySeconds)}`];
+	lines.push(`[lunit] ${summary.blocks} block${summary.blocks === 1 ? '' : 's'} ${how} in ${seconds(summary.wallSeconds)} wall time (${phases.join(', ')}): ${parts.join(', ')}.`);
+	if (summary.longest) {
+		const over = summary.long.length;
+		const list = summary.long
+			.slice(0, 5)
+			.map((entry) => `${entry.label} (${seconds(entry.seconds)})`)
+			.join(', ');
+		lines.push(
+			`[lunit] longest block ${seconds(summary.longest.seconds)}: ${summary.longest.label}; ${over} block${over === 1 ? '' : 's'} over ${report.longBlockSeconds} s${over > 0 ? `: ${list}${over > 5 ? ', ...' : ''}` : ''}.`,
+		);
+	}
+	if (report.excludedClasses > 0 || report.excludedTests > 0) {
+		lines.push(
+			`[lunit] Left out ${report.excludedClasses} Studio-tagged test class(es) and ${report.excludedTests} Studio-tagged test(s): run them with the Studio profile.`,
+		);
+	}
+	return lines;
+}
+
 export interface TestResultEntry extends TestIdentity, Verdict {}
 
 /**
@@ -86,6 +321,8 @@ export interface RunSummary {
 	error?: string;
 	/** Slow-tagged tests the run left out (not in `tests`); see runProfiles.ts. */
 	slowLeftOut?: number;
+	/** Timing and worker details of a parallel Lune run. */
+	lune?: RunTimingSummary;
 }
 
 /** Marker prefixing the JSON summary line the extension streams back to the CLI at the end of a `/run`. */
@@ -154,6 +391,11 @@ export function formatSummary(summary: RunSummary, workspaceRoot: string): strin
 	}
 	lines.push('');
 	lines.push(`[lunit] ${summary.tests.length} tests via ${target}: ${parts.join(', ')}.`);
+	if (summary.lune) {
+		const { blocks, workers, wallSeconds, longest } = summary.lune;
+		const longestText = longest ? `; longest block ${longest.seconds.toFixed(1)} s (${longest.label})` : '';
+		lines.push(`[lunit] ${blocks} block(s) on ${workers} worker(s), ${wallSeconds.toFixed(1)} s wall time${longestText}.`);
+	}
 	if (summary.slowLeftOut) {
 		lines.push(`[lunit] Left out ${summary.slowLeftOut} slow test(s): add --full to run them with Lune.`);
 	}

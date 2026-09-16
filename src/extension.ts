@@ -7,7 +7,7 @@ import { getConfig } from './vscodeConfig';
 import { DiscoveredClass, parseTestFile } from './discovery';
 import { CliRunRequest, LiveSyncBridge } from './liveSyncBridge';
 import { buildTestSelection } from './luauTestFilterTemplate';
-import { RunOutcome, runViaLune } from './luneRunner';
+import { LuneRunOutcome, RunOutcome, runViaLune } from './luneRunner';
 import {
 	partitionSlowTests,
 	RunProfileId,
@@ -18,16 +18,22 @@ import {
 import { createResultLineFilter, parseResultLines, ResultRecord } from './resultProtocol';
 import { isRojoServeRunning } from './rojoDetect';
 import {
+	BlockReport,
 	buildSummary,
+	LuneRunReport,
 	matchesFilters,
+	resolveBlockVerdict,
 	resolveVerdict,
 	RunSummary,
 	runsUnder,
 	RunVia,
+	summarizeReport,
 	TestIdentity,
 	TestResultEntry,
+	testsResolvedBy,
 	Verdict,
 } from './runReport';
+import { TestRef } from './luneBlocks';
 import { CancelSignal } from './cancelSignal';
 import { writeCliLauncher } from './cliLauncher';
 import {
@@ -491,6 +497,7 @@ async function runFromCli(
 			includeSlow,
 			onOutput,
 			explicitTests: false,
+			workers: request.workers,
 		});
 	} finally {
 		cliRunInProgress = false;
@@ -759,6 +766,8 @@ interface ExecuteRunOptions {
 	 * route passes false: its include list is whatever its filters matched.
 	 */
 	explicitTests?: boolean;
+	/** Lune only: overrides `lunit.lune.parallel.workers` for this run (the command line's `--workers`). */
+	workers?: number;
 }
 
 async function executeRun(
@@ -859,9 +868,6 @@ async function executeRun(
 	for (const leaf of leaves) {
 		run.enqueued(leaf);
 	}
-	for (const leaf of leaves) {
-		run.started(leaf);
-	}
 
 	const displayFilter = createResultLineFilter((text) => {
 		outputChannel.append(text);
@@ -869,25 +875,69 @@ async function executeRun(
 		onOutput?.(text);
 	});
 	const chunkSink = (chunk: string) => displayFilter.feed(chunk);
-
-	// A whole-tree run lets the Studio side run everything its tag rule allows;
-	// an explicit selection is narrowed to exactly the requested tests there.
-	const selection = request.include
-		? buildTestSelection(leaves.map(identityOf).filter((identity): identity is TestIdentity => identity !== undefined))
-		: undefined;
-
-	let outcome: RunOutcome;
-	try {
-		outcome =
-			via === 'lune'
-				? await runViaLune(config, token, chunkSink, slowFilter)
-				: await runViaStudio(config, token, chunkSink, liveSyncBridge, selection, slowFilter);
-	} catch (err) {
+	const failRun = (err: unknown): string => {
 		displayFilter.flush();
 		const message = `[lunit] test run failed: ${String(err)}`;
 		outputChannel.appendLine(message);
 		run.appendOutput(message.replace(/\n/g, '\r\n'));
 		onOutput?.(message + '\n');
+		return message;
+	};
+
+	const identities = leaves.map(identityOf).filter((identity): identity is TestIdentity => identity !== undefined);
+
+	if (via === 'lune') {
+		// Lune runs as a pool of worker processes (luneRunner.ts). Items move
+		// from queued to running to their verdict as each block starts and
+		// finishes, including tests a dependency group pulls in as
+		// prerequisites; whatever is left unresolved at the end (a cancelled
+		// block, a test no block ever mentioned) is settled by the report.
+		const progress = new LuneProgress(run, indexLeaves(controller), leaves);
+		// A whole-tree run lets the planner run everything the profile allows;
+		// any narrower request (a selection, or exclusions) names its tests.
+		const selection = request.include || excluded.size > 0 ? identities : undefined;
+		let outcome: LuneRunOutcome;
+		try {
+			outcome = await runViaLune(config, token, chunkSink, {
+				slow: slowFilter,
+				selection,
+				workers: options.workers,
+				hooks: {
+					onPlan: (report) => progress.onPlan(report),
+					onBlockStart: (block) => progress.onBlockStart(block),
+					onBlockDone: (block, report) => progress.onBlockDone(block, report),
+				},
+			});
+		} catch (err) {
+			const message = failRun(err);
+			const results = progress.finish(undefined, () => ({ status: 'errored', message }));
+			endRun();
+			return withSlowCount(buildSummary(via, [...results, ...leftOutResults], false));
+		}
+		displayFilter.flush();
+		const report = outcome.report;
+		const records = report ? [] : parseResultLines(outcome.output);
+		const results = progress.finish(report, (identity) =>
+			outcome.cancelled ? { status: 'skipped' } : resolveVerdict(identity, records, outcome),
+		);
+		endRun();
+		const summary = withSlowCount(buildSummary(via, [...results, ...leftOutResults], outcome.cancelled));
+		return report && report.blocks.length > 0 ? { ...summary, lune: summarizeReport(report) } : summary;
+	}
+
+	for (const leaf of leaves) {
+		run.started(leaf);
+	}
+
+	// A whole-tree run lets the Studio side run everything its tag rule allows;
+	// an explicit selection is narrowed to exactly the requested tests there.
+	const selection = request.include ? buildTestSelection(identities) : undefined;
+
+	let outcome: RunOutcome;
+	try {
+		outcome = await runViaStudio(config, token, chunkSink, liveSyncBridge, selection, slowFilter);
+	} catch (err) {
+		const message = failRun(err);
 		const results = applyVerdicts(run, leaves, () => ({ status: 'errored', message }));
 		endRun();
 		return withSlowCount(buildSummary(via, [...results, ...leftOutResults], false));
@@ -906,6 +956,123 @@ async function executeRun(
 	return withSlowCount(buildSummary(via, [...results, ...leftOutResults], false));
 }
 
+function testKey(test: TestRef): string {
+	return `${test.className}\u0000${test.methodName}`;
+}
+
+/** Every discovered test item, by class and method name, so a run can report on tests it pulled in beyond its request. */
+function indexLeaves(controller: vscode.TestController): Map<string, vscode.TestItem[]> {
+	const index = new Map<string, vscode.TestItem[]>();
+	controller.items.forEach((root) => {
+		const leaves: vscode.TestItem[] = [];
+		collectLeaves(root, leaves);
+		for (const leaf of leaves) {
+			const identity = identityOf(leaf);
+			if (!identity) {
+				continue;
+			}
+			const key = testKey(identity);
+			const list = index.get(key);
+			if (list) {
+				list.push(leaf);
+			} else {
+				index.set(key, [leaf]);
+			}
+		}
+	});
+	return index;
+}
+
+/**
+ * Mirrors a parallel Lune run onto the TestRun as it happens. The primary
+ * leaves are what the request asked for; a dependency group's prerequisite
+ * modules add further leaves, which are queued and reported the same way.
+ * Each leaf gets exactly one verdict: from the first block that settles it,
+ * or from `finish` for anything still open when the run ends.
+ */
+class LuneProgress {
+	private readonly queued = new Set<string>();
+	private readonly started = new Set<string>();
+	private readonly resolved = new Set<string>();
+	private readonly extras: vscode.TestItem[] = [];
+	private readonly results: TestResultEntry[] = [];
+
+	constructor(
+		private readonly run: vscode.TestRun,
+		private readonly leafIndex: Map<string, vscode.TestItem[]>,
+		private readonly primary: vscode.TestItem[],
+	) {
+		for (const leaf of primary) {
+			this.queued.add(leaf.id);
+		}
+	}
+
+	private leavesFor(test: TestRef): vscode.TestItem[] {
+		return this.leafIndex.get(testKey(test)) ?? [];
+	}
+
+	onPlan(report: LuneRunReport): void {
+		for (const block of report.blocks) {
+			for (const test of block.tests) {
+				for (const leaf of this.leavesFor(test)) {
+					if (!this.queued.has(leaf.id)) {
+						this.queued.add(leaf.id);
+						this.extras.push(leaf);
+						this.run.enqueued(leaf);
+					}
+				}
+			}
+		}
+		for (const entry of report.unscheduled) {
+			this.settle(entry.test, report);
+		}
+	}
+
+	onBlockStart(block: BlockReport): void {
+		for (const test of block.tests) {
+			for (const leaf of this.leavesFor(test)) {
+				if (this.queued.has(leaf.id) && !this.started.has(leaf.id) && !this.resolved.has(leaf.id)) {
+					this.started.add(leaf.id);
+					this.run.started(leaf);
+				}
+			}
+		}
+	}
+
+	onBlockDone(block: BlockReport, report: LuneRunReport): void {
+		for (const test of testsResolvedBy(report, block)) {
+			this.settle(test, report);
+		}
+	}
+
+	/** Settles every leaf still open and returns every verdict applied during the run. */
+	finish(report: LuneRunReport | undefined, fallback: (identity: TestIdentity) => Verdict): TestResultEntry[] {
+		for (const leaf of [...this.primary, ...this.extras]) {
+			if (this.resolved.has(leaf.id)) {
+				continue;
+			}
+			const known = identityOf(leaf);
+			this.apply(leaf, known, known ? (report ? resolveBlockVerdict(known, report) : fallback(known)) : undefined);
+		}
+		return this.results;
+	}
+
+	private settle(test: TestRef, report: LuneRunReport): void {
+		for (const leaf of this.leavesFor(test)) {
+			if (!this.queued.has(leaf.id) || this.resolved.has(leaf.id)) {
+				continue;
+			}
+			const known = identityOf(leaf);
+			this.apply(leaf, known, known ? resolveBlockVerdict(known, report) : undefined);
+		}
+	}
+
+	private apply(leaf: vscode.TestItem, known: TestIdentity | undefined, verdict: Verdict | undefined): void {
+		this.resolved.add(leaf.id);
+		this.results.push(applyVerdict(this.run, leaf, known, verdict));
+	}
+}
+
 /**
  * Applies one verdict per leaf onto the VS Code TestRun and returns the same
  * verdicts as plain data for the run summary. A leaf whose metadata is
@@ -917,29 +1084,34 @@ function applyVerdicts(
 	leaves: vscode.TestItem[],
 	verdictFor: (identity: TestIdentity) => Verdict,
 ): TestResultEntry[] {
-	const results: TestResultEntry[] = [];
-	for (const leaf of leaves) {
+	return leaves.map((leaf) => {
 		const known = identityOf(leaf);
-		const identity: TestIdentity = known ?? { file: leaf.uri?.fsPath ?? '', className: '', methodName: leaf.label };
-		const verdict: Verdict = known
-			? verdictFor(known)
-			: { status: 'errored', message: 'Test item has no discovery metadata.' };
+		return applyVerdict(run, leaf, known, known ? verdictFor(known) : undefined);
+	});
+}
 
-		switch (verdict.status) {
-			case 'passed':
-				run.passed(leaf, verdict.elapsedMs);
-				break;
-			case 'failed':
-				run.failed(leaf, new vscode.TestMessage(verdict.message ?? 'Test failed'), verdict.elapsedMs);
-				break;
-			case 'skipped':
-				run.skipped(leaf);
-				break;
-			case 'errored':
-				run.errored(leaf, new vscode.TestMessage(verdict.message ?? 'Test errored'));
-				break;
-		}
-		results.push({ ...identity, ...verdict });
+/** Applies one leaf's verdict to the TestRun; no verdict means the leaf has no discovery metadata. */
+function applyVerdict(
+	run: vscode.TestRun,
+	leaf: vscode.TestItem,
+	known: TestIdentity | undefined,
+	verdict: Verdict | undefined,
+): TestResultEntry {
+	const identity: TestIdentity = known ?? { file: leaf.uri?.fsPath ?? '', className: '', methodName: leaf.label };
+	const applied: Verdict = verdict ?? { status: 'errored', message: 'Test item has no discovery metadata.' };
+	switch (applied.status) {
+		case 'passed':
+			run.passed(leaf, applied.elapsedMs);
+			break;
+		case 'failed':
+			run.failed(leaf, new vscode.TestMessage(applied.message ?? 'Test failed'), applied.elapsedMs);
+			break;
+		case 'skipped':
+			run.skipped(leaf);
+			break;
+		case 'errored':
+			run.errored(leaf, new vscode.TestMessage(applied.message ?? 'Test errored'));
+			break;
 	}
-	return results;
+	return { ...identity, ...applied };
 }

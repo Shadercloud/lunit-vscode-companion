@@ -51,6 +51,22 @@ export interface LunitConfig {
 		 * runs them. Empty turns the feature (and the Full profile) off.
 		 */
 		slowTags: string[];
+		parallel: {
+			/**
+			 * Run each test module (or, for a @Tag("Parallel") class, each
+			 * test method and @Each row) in its own Lune process, several at
+			 * a time. False runs every module in one Lune process, sharing one
+			 * module cache, as the profile did before 0.7.0.
+			 */
+			enabled: boolean;
+			/** Maximum concurrent Lune processes; 0 picks min(32, logical CPUs). Capped by the number of blocks. */
+			workers: number;
+			/**
+			 * Modules that must run in prerequisite-first order inside one
+			 * Lune process (see luneBlocks.ts). Validated before scheduling.
+			 */
+			dependencyGroups: string[][];
+		};
 	};
 	studio: {
 		enabled: boolean;
@@ -89,6 +105,27 @@ function normalizeTagList(value: unknown): string[] {
 	return value.filter((tag): tag is string => typeof tag === 'string').map((tag) => tag.trim()).filter((tag) => tag.length > 0);
 }
 
+/** A non-negative integer worker count, or 0 ("automatic") for anything else. */
+function normalizeWorkers(value: unknown): number {
+	return typeof value === 'number' && Number.isFinite(value) && value >= 1 ? Math.floor(value) : 0;
+}
+
+/**
+ * Dependency groups as the planner validates them. Nothing is dropped
+ * silently: a malformed entry is kept in a shape the planner will reject
+ * with a message naming it, rather than quietly running without it.
+ */
+function normalizeDependencyGroups(value: unknown): string[][] {
+	if (!Array.isArray(value)) {
+		return [];
+	}
+	return value.map((group) =>
+		Array.isArray(group)
+			? group.map((member) => String(member).trim()).filter((member) => member.length > 0)
+			: [String(group).trim()],
+	);
+}
+
 /** Every default in one place -- must match the `contributes.configuration` block in package.json. */
 export function buildConfig(root: string, storageDir: string, get: SettingReader): LunitConfig {
 	const outDirName = get<string>('outDir', 'out');
@@ -120,6 +157,11 @@ export function buildConfig(root: string, storageDir: string, get: SettingReader
 			lunitRoot: resolveTokens(get<string>('lunitRoot', '${workspaceFolder}/node_modules/@rbxts/lunit/out'), baseTokens),
 			projectFile: resolveTokens(get<string>('lune.projectFile', ''), baseTokens),
 			slowTags: normalizeTagList(get<unknown>('lune.slowTags', [])),
+			parallel: {
+				enabled: get<boolean>('lune.parallel.enabled', true) !== false,
+				workers: normalizeWorkers(get<unknown>('lune.parallel.workers', 0)),
+				dependencyGroups: normalizeDependencyGroups(get<unknown>('lune.parallel.dependencyGroups', [])),
+			},
 		},
 		studio: {
 			enabled: get<boolean>('studio.enabled', true),

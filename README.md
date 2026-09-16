@@ -107,8 +107,10 @@ profile actually runs things.
   report does. Each row also shows its own `@Tag` values and `skip` / `only` / `each xN` markers (a
   conditional `@Skip(condition, ...)` is decided at run time, so it isn't marked), and tags are exposed to the
   Test Explorer's filter box: type `@lunitTests:Studio` (or `@lunitTests:skip`) to narrow the tree.
-- **Run with Lune**: compiles the project (`npx rbxtsc` by default), regenerates a small generated Lune
-  entry script, and runs it, reflecting pass/fail/skip back onto the tree with inline failure messages.
+- **Run with Lune**: compiles the project (`npx rbxtsc` by default), regenerates a small Lune worker
+  script, and runs the test modules through a pool of independent Lune processes (see
+  [Parallel Lune runs](#parallel-lune-runs)), reflecting pass/fail/skip back onto the tree with inline
+  failure messages as each block finishes.
 - **Run in Roblox Studio**: if an already-open Studio instance has this project live-synced via your own
   `rojo serve` and the companion Studio plugin is installed, runs tests there directly (no new Studio process,
   no Play mode). Otherwise compiles the project, bakes the compiled output into a standalone place file
@@ -344,6 +346,70 @@ class WorldGeneration {
 }
 ```
 
+### Parallel Lune runs
+
+Both Lune profiles run tests in a bounded pool of independent Lune processes, so a CPU-heavy suite uses
+every core rather than one. A run compiles the project once, then one discovery process loads every test
+module and lists each class's compiled Lunit metadata (tests, tags, `@Each` rows, lifecycle hooks,
+`@Order`, `@Only`). From that the extension plans *blocks* and runs them through at most N workers: the
+moment a worker finishes a block it takes the next pending one, and Test Explorer items move from
+queued to running to their verdict as their block starts and finishes.
+
+- **One test module per block** by default. The whole class runs in one VM exactly as before: its
+  method ordering, `@BeforeAll`/`@AfterAll`/`@BeforeEach`/`@AfterEach` hooks and any state shared
+  between its methods are untouched. What changes is *between* modules: every block has its own module
+  cache and globals, so a module that relied on another module having run earlier in the same process no
+  longer sees it (see dependency groups below).
+- **Per-case blocks with `@Tag("Parallel")`.** A class-level `@Tag("Parallel")` runs each of its test
+  methods, and each `@Each` row, as its own block in a fresh Lune VM with a fresh class instance;
+  `@BeforeEach`/`@AfterEach` run inside every block. It is safe exactly when every method and row can
+  run alone, in any order, from a fresh process: no state shared between methods, no cache one method
+  fills for another, no ordering. A class that also has `@BeforeAll`/`@AfterAll`, `@Order`, or a method
+  that is both a `@Test` and a lifecycle hook cannot be split safely, so its tests are reported as
+  **errored** with a message saying why; remove the tag or restructure the class. Everything *inside*
+  one method still runs together, so a test that compares two results computes both itself. Long,
+  independent sweeps (many seeds, many rows) are the typical candidates.
+- **Dependency groups.** Modules that depend on each other go in
+  `lunit.lune.parallel.dependencyGroups`, prerequisite first:
+
+  ```json
+  "lunit.lune.parallel.dependencyGroups": [["tests/setup.test.ts", "tests/consumer.test.ts"]]
+  ```
+
+  The modules of a group load into one Lune process and their classes run in that order; a group takes
+  precedence over `@Tag("Parallel")`. Name a module as the run output shows it (`out/tests/setup.test`
+  for a package project, `ReplicatedStorage.Tests.setup.test` for a game project) or by any unique
+  trailing part, the source path included. Selecting a test in a group also runs the modules listed
+  before its module, in full, and the output says so ("... run in full before the selected tests in
+  ..."); their results show up in the tree too. An unknown, ambiguous or repeated name stops the run with
+  an error naming it, and a module can belong to one group only. Process isolation cannot isolate
+  external resources (files, servers): put every user of such a resource in one group.
+- **Workers.** `lunit.lune.parallel.workers` (default `0`: the smaller of 32 and the logical CPU count),
+  always capped by the number of blocks; `1` runs the blocks one after another, still isolated. Values
+  above 32 such as `64` are allowed. Concurrent VM start-ups and memory contend, so whether 64 beats 32
+  on a 64-core machine depends on the suite (one project's own runner measured 32 as faster; the same
+  suite through this extension ran faster at 64), so measure before raising it. On the command line,
+  `--workers N` overrides it for one run.
+- **Output.** Each worker's output streams to the Lunit output channel prefixed with its block id
+  (`[#12]`), after a `[lunit] #12 started: <module>` line, and ends with `PASS`, `FAIL`, `ERROR` or
+  `CANCELLED` and the block's seconds. The run closes with the number of blocks and workers, the wall
+  time (compile and discovery separately), the longest block, and the blocks over 10 s. That threshold is
+  an optimization target, not a timeout: nothing fails for being slow.
+- **Nothing passes by omission.** A worker that crashes, is killed, prints no block summary, or prints
+  one that disagrees with its result lines errors every test of that block, with the worker's last lines
+  in the message. A test its block never reported is errored. Cancelling stops the running workers (their
+  whole process trees), starts nothing else, and reports what did not run as skipped.
+- **Selection.** Run-all, folder, file, class and single-test selection, exclusions, the runtime tags and
+  the slow rule work as before; the Lune profile now runs *only* the selected tests (plus any dependency
+  prerequisites) instead of the whole suite. The tree shows one item per `@Test` method, so a
+  parameterized method's rows are folded onto it: any failing row fails the item and the message names
+  the row; selecting the method runs every one of its eligible rows. Individual rows cannot be selected.
+- **Turning it off.** `lunit.lune.parallel.enabled: false` runs every module in one Lune process with
+  one shared module cache, as the profile did before 0.7.0; `@Tag("Parallel")` is ignored then.
+
+Generated scripts and job files are written to a per-run directory under the extension's storage, so two
+runs at once (say the Test Explorer and the command line) never overwrite each other's files.
+
 ## Running tests from the command line (for coding agents)
 
 Nothing outside VS Code can press the Test Explorer's Run button, so the extension ships a command-line
@@ -361,6 +427,8 @@ installed version, so the path stays stable across extension updates. Options:
 - `--studio` (default) is "Run in Roblox Studio"; `--lune` is "Run with Lune"; `--full` is "Run with Lune
   (Full)", which also runs tests tagged with one of `lunit.lune.slowTags` (see
   [Slow tests and the Full profile](#slow-tests-and-the-full-profile)).
+- `--workers N` (Lune only) caps the number of Lune processes for this run; `--workers 1` runs the
+  blocks one by one. See [Parallel Lune runs](#parallel-lune-runs).
 - Any other arguments are filters: case-insensitive substrings matched against each test's
   workspace-relative file path, class name, method name and display name (a test runs if any filter
   matches). `... --studio MyFeature` or `... --studio src/foo.test.ts`, for example.

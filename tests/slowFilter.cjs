@@ -101,11 +101,11 @@ module.exports = function runSlowFilterChecks(scriptDir) {
 		secondTag: 'true false 0 0 | quick,soak',
 	});
 
-	// The package Lune runner embeds the same helpers with no excluded tag; it must still compile.
+	// The package Lune worker applies no rule of its own (the planner decides); it must still compile.
 	const packageScript = path.join(scriptDir, 'package-runner-compile.luau');
 	fs.writeFileSync(
 		packageScript,
-		`local luau = require("@lune/luau")\nlocal source = ${JSON.stringify(buildLuneRunnerScript('./promise', { tags: ['Slow'] }))}\nluau.compile(source)\nprint("compiled")`,
+		`local luau = require("@lune/luau")\nlocal source = ${JSON.stringify(buildLuneRunnerScript('./promise'))}\nluau.compile(source)\nprint("compiled")`,
 	);
 	const compiled = spawnSync(process.env.LUNE_EXE || 'lune', ['run', packageScript], { encoding: 'utf8' });
 	assert.strictEqual(compiled.status, 0, `${compiled.stdout}${compiled.stderr}`);
