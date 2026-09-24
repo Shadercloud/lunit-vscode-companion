@@ -137,7 +137,7 @@ export function detectOutputKind(outDir: string): LuneProjectKind | undefined {
  * actually references the configured output directory and otherwise decline
  * to guess.
  */
-function pickProjectFile(root: string, outDirName: string): string | undefined {
+export function pickRojoProjectFile(root: string, outDirName: string): string | undefined {
 	const candidates = findRojoProjectFiles(root);
 	if (candidates.length <= 1) {
 		return candidates[0];
@@ -184,7 +184,7 @@ export function detectLuneProject(options: {
 	}
 
 	const outDirName = path.basename(outDir);
-	const projectFile = pickProjectFile(workspaceRoot, outDirName);
+	const projectFile = pickRojoProjectFile(workspaceRoot, outDirName);
 	if (projectFile === undefined) {
 		const candidates = findRojoProjectFiles(workspaceRoot);
 		return {

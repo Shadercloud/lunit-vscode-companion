@@ -1,6 +1,7 @@
 // Runs every check that needs Lune on PATH (or LUNE_EXE): the Studio
-// live-sync and plugin scripts, the slow-tag filter, then the Lune profile
-// against the game fixture and the package fixture.
+// live-sync and plugin scripts, the slow-tag filter, the standalone Studio
+// place for a game project (which also needs Rojo on PATH, or ROJO_EXE), then
+// the Lune profile against the game fixture and the package fixture.
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -25,6 +26,7 @@ async function main() {
 		}
 		require('./slowFilter.cjs')(dir);
 		require('./studioTags.cjs')(dir);
+		await require('./studioGame.cjs')(dir);
 		await require('./luneGame.cjs')(dir);
 		await require('./luneParallel.cjs')(dir);
 		require('./luneCli.cjs')(dir);

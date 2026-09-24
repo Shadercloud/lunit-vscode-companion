@@ -1,0 +1,10 @@
+{
+	"name": "hearth-fixture",
+	"private": true,
+	"scripts": {
+		"build": "rbxtsc --type game --rojo dev.project.json",
+		"build:lobby": "rbxtsc --type game --rojo lobby.project.json",
+		"build:all": "concurrently \"npm:build\" \"npm:build:lobby\"",
+		"place": "npm run build && rojo build dev.project.json -o build/dev.rbxl"
+	}
+}

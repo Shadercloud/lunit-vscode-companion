@@ -1,0 +1,42 @@
+{
+	"name": "Lunit Game Studio Fixture",
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"$className": "ReplicatedStorage",
+			"rbxts_include": {
+				"$path": "include",
+				"node_modules": {
+					"$className": "Folder",
+					"@rbxts": {
+						"$path": "node_modules/@rbxts"
+					}
+				}
+			},
+			"Common": {
+				"$path": { "optional": "out/src/shared" }
+			},
+			"Tests": {
+				"$className": "Folder",
+				"Common": {
+					"$path": { "optional": "out/tests/shared" }
+				}
+			}
+		},
+		"StarterPlayer": {
+			"$className": "StarterPlayer",
+			"StarterPlayerScripts": {
+				"$className": "StarterPlayerScripts",
+				"Common": {
+					"$path": { "optional": "out/src/client" }
+				},
+				"Tests": {
+					"$className": "Folder",
+					"Common": {
+						"$path": { "optional": "out/tests/client" }
+					}
+				}
+			}
+		}
+	}
+}

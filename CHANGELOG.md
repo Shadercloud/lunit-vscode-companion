@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.1
+
+### Fixed
+
+- **"Run in Roblox Studio" without a connected Rojo-synced Studio now works for roblox-ts game
+  projects.** The standalone fallback used to mount the compiled output under an invented
+  `ReplicatedStorage.rbxts_include.node_modules.@rbxts.<package>` tree, as if every project were an rbxts
+  package. A `--type game` project is compiled *for* the Rojo tree its `rbxtsc --rojo <file>` names (a test
+  under `tests/` importing from `src/` becomes `TS.import(script, script.Parent.Parent.Parent, "Common", ...)`),
+  so in the relocated tree every such import hung on `WaitForChild("Common")` ("Infinite yield possible").
+  The place is now built from the project's own Rojo file: **`lunit.studio.rojoProject`** if set, else the
+  `--rojo` flag in the compile command (followed through `npm run` scripts), else `lunit.lune.projectFile` or
+  the one `*.project.json` at the workspace root. The generated bootstrap script still runs via
+  `--runScriptFile`, so nothing is injected into the place. If no project file can be found, or `rojo build`
+  fails, the run stops with exit code 2 and a message saying to connect Rojo or set `lunit.studio.rojoProject`,
+  instead of building a place that cannot resolve requires. Only a real rbxts package (`package.json`
+  `main`/`types` under the output directory, or `script`-relative compiled output) keeps the self-contained
+  package layout. `${projectFile}` in `lunit.studio.buildPlaceCommand` now names whichever project was chosen.
+- The command line exits with code 2 (not 1) when a Studio run could not start at all, and the Test Explorer
+  shows that reason on each requested test.
+
 ## 0.7.0
 
 ### Added

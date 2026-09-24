@@ -20,6 +20,12 @@ export interface RunOutcome {
 	output: string;
 	timedOut: boolean;
 	cancelled: boolean;
+	/**
+	 * Set when the run could not be performed at all (nothing was executed):
+	 * the message to show for every requested test, and the reason the
+	 * command line exits with code 2 rather than 1.
+	 */
+	error?: string;
 }
 
 /**

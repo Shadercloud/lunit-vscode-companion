@@ -2,7 +2,7 @@
   "name": "vscode-lunit-companion",
   "displayName": "Lunit Test Companion",
   "description": "Discover and run @rbxts/lunit tests from VS Code's Test Explorer.",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "publisher": "ShaderCloud",
   "author": "ShaderCloud",
   "license": "MIT",
@@ -174,15 +174,20 @@
           "default": "",
           "description": "Absolute path to RobloxStudioBeta.exe. Leave blank to auto-detect the latest installed version under %LOCALAPPDATA%\\Roblox\\Versions (Windows)."
         },
+        "lunit.studio.rojoProject": {
+          "type": "string",
+          "default": "",
+          "description": "Rojo project file (relative to the workspace folder, or absolute) that the standalone \"Run in Roblox Studio\" run builds its temporary place from when no live-synced Studio is connected. A roblox-ts game project (rbxtsc --type game) compiles its tests for one specific Rojo tree, so the place has to come from that same project file. Leave empty to use the *.project.json named by the compile command's --rojo flag (following npm scripts), else default.project.json, else what the compiled output implies. Only a real roblox-ts package (package.json main/types under the output directory, or script-relative compiled output) still gets the extension's own self-contained test project."
+        },
         "lunit.studio.buildPlaceCommand": {
           "type": "string",
           "default": "npx rojo build \"${projectFile}\" --output \"${placeFile}\"",
-          "description": "Command that builds the standalone .rbxl place file Studio's CLI opens. Defaults to the extension's own self-contained, auto-generated test project (no default.project.json required) -- override only if you need tests to run against your project's real place instead."
+          "description": "Command that builds the standalone .rbxl place file Studio's CLI opens. ${projectFile} is the Rojo project chosen for the run: your project's own (see lunit.studio.rojoProject) for a roblox-ts game project, or the extension's self-contained, auto-generated test project for a package."
         },
         "lunit.studio.projectFile": {
           "type": "string",
           "default": "${storageDir}/studio-test.project.json",
-          "description": "Path to the auto-generated, self-contained Rojo project file used to build the test place. Fully auto-generated and regenerated before every run -- not meant to be hand-edited. Lives in this extension's per-workspace storage, outside your project, by default."
+          "description": "Path to the auto-generated, self-contained Rojo project file used to build the test place for a roblox-ts package project. Fully auto-generated and regenerated before every run -- not meant to be hand-edited. Lives in this extension's per-workspace storage, outside your project, by default. A game project builds from its own Rojo project instead (lunit.studio.rojoProject)."
         },
         "lunit.studio.placeFile": {
           "type": "string",

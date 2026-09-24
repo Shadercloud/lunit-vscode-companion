@@ -3,7 +3,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { CancelSignal } from './cancelSignal';
 import { buildStudioBootstrapScript } from './bootstrapTemplate';
-import { LunitConfig } from './config';
+import { LunitConfig, resolveBuildPlaceCommand } from './config';
+import { detectStudioProject, describeStudioProjectRemedy, StudioProjectDetection } from './studioProjectKind';
 import { LiveSyncBridge } from './liveSyncBridge';
 import { buildLiveSyncJobScript } from './liveSyncScriptTemplate';
 import { SlowTestFilter, TestSelection } from './luauTestFilterTemplate';
@@ -264,16 +265,27 @@ function readPackageName(cwd: string): string {
 }
 
 /**
- * Regenerates the self-contained test Rojo project (studioProjectTemplate.ts)
- * and the bootstrap script (bootstrapTemplate.ts), both always overwritten --
- * see those files for why this needs no default.project.json or hand-edited
- * bootstrap script from the consuming project at all.
+ * Which Rojo project the standalone Studio place is built from -- the
+ * project's own for a roblox-ts game project, the generated package layout
+ * otherwise. See studioProjectKind.ts for the rules and the reason.
  */
-export function regenerateStudioFiles(
-	config: LunitConfig,
-	selection?: TestSelection,
-	slow?: SlowTestFilter,
-): { projectFile: string; bootstrapScript: string } {
+export function detectStudioProjectFor(config: LunitConfig): StudioProjectDetection {
+	return detectStudioProject({
+		workspaceRoot: config.workspaceRoot,
+		outDir: config.outDir,
+		compileCommand: config.compileCommand,
+		configuredProjectFile: config.studio.rojoProject,
+		luneProjectFile: config.lune.projectFile,
+	});
+}
+
+/**
+ * Writes the self-contained test Rojo project (studioProjectTemplate.ts) for
+ * a roblox-ts *package*, always overwritten -- see that file for why a package
+ * needs no default.project.json of its own. Never used for a game project:
+ * its compiled output only resolves in the tree its own Rojo file describes.
+ */
+export function writePackageLayoutProjectFile(config: LunitConfig): string {
 	const cwd = config.workspaceRoot;
 	const projectFile = config.studio.projectFile;
 	fs.mkdirSync(path.dirname(projectFile), { recursive: true });
@@ -296,11 +308,39 @@ export function regenerateStudioFiles(
 		extraPackages: nestedPackages,
 	});
 	fs.writeFileSync(projectFile, projectContent, 'utf8');
+	return projectFile;
+}
 
+/** Writes the bootstrap script (bootstrapTemplate.ts) Studio runs against the built place, always overwritten. */
+export function writeStudioBootstrapScript(
+	config: LunitConfig,
+	layout: 'package' | 'game',
+	selection?: TestSelection,
+	slow?: SlowTestFilter,
+): string {
 	fs.mkdirSync(path.dirname(config.studio.bootstrapScript), { recursive: true });
-	fs.writeFileSync(config.studio.bootstrapScript, buildStudioBootstrapScript(selection, slow), 'utf8');
+	fs.writeFileSync(config.studio.bootstrapScript, buildStudioBootstrapScript(selection, slow, { layout }), 'utf8');
+	return config.studio.bootstrapScript;
+}
 
-	return { projectFile, bootstrapScript: config.studio.bootstrapScript };
+/**
+ * Regenerates what the standalone Studio run would use: the bootstrap script
+ * for the detected layout and, for a package project, the generated Rojo
+ * project. `projectFile` is the Rojo project the place would be built from
+ * (the project's own for a game project), or undefined when the run would
+ * be blocked -- see `detection.blocked`.
+ */
+export function regenerateStudioFiles(
+	config: LunitConfig,
+	selection?: TestSelection,
+	slow?: SlowTestFilter,
+): { detection: StudioProjectDetection; projectFile: string | undefined; bootstrapScript: string } {
+	const detection = detectStudioProjectFor(config);
+	const bootstrapScript = writeStudioBootstrapScript(config, detection.kind, selection, slow);
+	if (detection.kind === 'package') {
+		return { detection, projectFile: writePackageLayoutProjectFile(config), bootstrapScript };
+	}
+	return { detection, projectFile: detection.projectFile, bootstrapScript };
 }
 
 /**
@@ -375,10 +415,13 @@ async function runViaLiveSync(
 }
 
 /**
- * Compiles the project, regenerates the self-contained test Rojo project and
- * bootstrap script, bakes them into a standalone place file, and launches
- * Roblox Studio's "--task RunScript" CLI mode to run the bootstrap script
- * against it, capturing its --outputFile log. If `bridge` has a connected
+ * Compiles the project, regenerates the bootstrap script, builds a standalone
+ * place file -- from the project's own Rojo file for a roblox-ts game
+ * project, or from the generated self-contained test project for a package
+ * (see studioProjectKind.ts) -- and launches Roblox Studio's "--task
+ * RunScript" CLI mode to run the bootstrap script against it, capturing its
+ * --outputFile log. A game project with no Rojo project to build from, or a
+ * failed build, ends the run with code 2 and `error` set. If `bridge` has a connected
  * Studio plugin and `lunit.studio.liveSync.enabled` is true, delegates to
  * the faster live-sync path (runViaLiveSync) instead -- see there.
  *
@@ -421,29 +464,46 @@ export async function runViaStudio(
 		}
 	}
 
-	const rbxtsIncludePath = path.join(cwd, RBXTS_INCLUDE_RELATIVE);
-	if (!fs.existsSync(rbxtsIncludePath)) {
-		const message = `[lunit] could not find ${RBXTS_INCLUDE_RELATIVE} -- is roblox-ts installed in this project?\n`;
-		onOutput(message);
-		return { code: null, output: message, timedOut: false, cancelled: false };
+	// Which tree the place is built from decides whether the compiled tests
+	// can resolve their imports at all -- see studioProjectKind.ts.
+	const detection = detectStudioProjectFor(config);
+	onOutput(`[lunit] ${detection.reason}.\n`);
+	if (detection.blocked) {
+		onOutput(`${detection.blocked}\n`);
+		return { code: 2, output: detection.blocked, timedOut: false, cancelled: false, error: detection.blocked };
 	}
 
-	regenerateStudioFiles(config, selection, slow);
+	let projectFile: string;
+	if (detection.kind === 'game' && detection.projectFile) {
+		projectFile = detection.projectFile;
+	} else {
+		const rbxtsIncludePath = path.join(cwd, RBXTS_INCLUDE_RELATIVE);
+		if (!fs.existsSync(rbxtsIncludePath)) {
+			const message = `[lunit] could not find ${RBXTS_INCLUDE_RELATIVE} -- is roblox-ts installed in this project?`;
+			onOutput(`${message}\n`);
+			return { code: 2, output: message, timedOut: false, cancelled: false, error: message };
+		}
+		projectFile = writePackageLayoutProjectFile(config);
+	}
+	writeStudioBootstrapScript(config, detection.kind, selection, slow);
 
 	await fs.promises.mkdir(path.dirname(studio.placeFile), { recursive: true });
-	onOutput(`> ${studio.buildPlaceCommand}\n`);
-	const buildResult = await runCommand(studio.buildPlaceCommand, { cwd, env: config.env, token, onOutput });
+	await fs.promises.rm(studio.placeFile, { force: true });
+	const buildPlaceCommand = resolveBuildPlaceCommand(studio.buildPlaceCommand, projectFile);
+	onOutput(`> ${buildPlaceCommand}\n`);
+	const buildResult = await runCommand(buildPlaceCommand, { cwd, env: config.env, token, onOutput });
 	if (buildResult.cancelled || buildResult.timedOut) {
 		return buildResult;
 	}
 	if (buildResult.code !== 0) {
 		const diagnosis = describeToolFailure(buildResult.output);
-		onOutput(
-			diagnosis
-				? `\n${diagnosis}\n`
-				: `\n[lunit] failed to build the Studio place file (exit code ${buildResult.code}), aborting test run.\n`,
-		);
-		return buildResult;
+		const message = diagnosis
+			? diagnosis
+			: detection.kind === 'game'
+				? `[lunit] "rojo build" failed (exit code ${buildResult.code}) for ${projectFile}, so there is no place to run the tests in. ${describeStudioProjectRemedy()}`
+				: `[lunit] failed to build the Studio place file (exit code ${buildResult.code}), aborting test run.`;
+		onOutput(`\n${message}\n`);
+		return { ...buildResult, code: 2, error: message };
 	}
 
 	const executable = findStudioExecutable(studio.executablePath);

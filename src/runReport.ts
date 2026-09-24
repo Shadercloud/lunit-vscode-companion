@@ -66,6 +66,9 @@ export function resolveVerdict(test: TestIdentity, records: readonly ResultRecor
 	if (outcome.timedOut) {
 		return { status: 'errored', message: TIMED_OUT_MESSAGE };
 	}
+	if (outcome.error && records.length === 0) {
+		return { status: 'errored', message: outcome.error };
+	}
 	if (outcome.code !== 0 && records.length === 0) {
 		return { status: 'errored', message: NO_RESULTS_MESSAGE };
 	}

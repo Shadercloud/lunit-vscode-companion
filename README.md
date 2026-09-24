@@ -220,31 +220,38 @@ previous session). Without one, live-sync falls back to standalone mode below ev
 checking if a run unexpectedly launches a new Studio process instead of using one you already have open.
 
 **Standalone mode** -- the fallback whenever no plugin is currently connected, or this project has no Rojo
-project file of its own (see above); the common case for a package developed and tested on its own, e.g. a
-single library repo with no dev workspace around it. Zero-config by
-design here too: no `default.project.json`, no hand-edited bootstrap script, nothing to add to the project
-being tested. Builds its own throwaway place and launches a real Studio process via Studio's own documented
-CLI automation flags (`--task RunScript --localPlaceFile ... --runScriptFile ... --outputFile ...
---quitAfterExecution`), no companion plugin needed for this mode. Slower (a fresh Studio has to launch and
-load), which is exactly why live-sync mode is preferred whenever it's available. On every run in this mode,
-the extension:
+project file of its own (see above). Builds a throwaway place and launches a real Studio process via
+Studio's own documented CLI automation flags (`--task RunScript --localPlaceFile ... --runScriptFile ...
+--outputFile ... --quitAfterExecution`), no companion plugin needed for this mode. Slower (a fresh Studio
+has to launch and load), which is exactly why live-sync mode is preferred whenever it's available. On every
+run in this mode, the extension:
 
 1. Compiles the project (unless `lunit.skipCompile`).
-2. Generates its own small, self-contained Rojo project (in this extension's storage directory, always
-   regenerated) mapping just what's needed to run tests: `node_modules/roblox-ts/include` (the TS runtime),
-   every `@scope` folder under `node_modules` that actually contains Luau content (not just `@rbxts` --
-   e.g. `@rbxts/react` itself depends on `react-lua`'s internals published under a *different* scope,
-   `@rbxts-js`), and the compiled package itself -- mounted *as if* it were just another dependency under its
-   own scope, alongside its real siblings, which is what lets any test file's
-   `import { X } from "@rbxts/whatever"` resolve correctly regardless of the consuming project's own Rojo
-   setup (or lack of one -- library packages like `@rbxts/react-clean-ui` usually don't have their own
-   `default.project.json`, since they're never built into a real place on their own).
-3. Builds that into a place file with `rojo build` (override `lunit.studio.buildPlaceCommand` if you'd
-   rather run tests against your project's *real* place -- see the note below).
+2. Decides which Rojo project to build the place from, and says so in the output:
+   - **A roblox-ts game project** (`rbxtsc --type game`, the usual shape for an actual game) is compiled
+     *for* the tree its `--rojo` project file describes: a test under `tests/common/client` importing from
+     `src/common/client` compiles to `TS.import(script, script.Parent.Parent.Parent, "Common", ...)`, which
+     only resolves when the compiled test sits beside the source folder exactly where that project puts it.
+     So the place is built from the project's **own** Rojo file: `lunit.studio.rojoProject` if set, else the
+     file named by the compile command's `--rojo` flag (followed through `npm run ...` scripts), else
+     `lunit.lune.projectFile` or the one `*.project.json` at the workspace root. If none can be found, or
+     `rojo build` fails, the run stops with exit code 2 and a message saying to connect Rojo (live-sync
+     mode) or set `lunit.studio.rojoProject` -- rather than building a place in which no import resolves.
+   - **A roblox-ts package** (a `package.json` whose `main`/`types` point into the output directory, or
+     compiled output that is `script`-relative) needs no Rojo project of its own: the extension generates a
+     small, self-contained one (in its storage directory, always regenerated) mapping just what's needed:
+     `node_modules/roblox-ts/include` (the TS runtime), every `@scope` folder under `node_modules` that
+     actually contains Luau content (not just `@rbxts` -- e.g. `@rbxts/react` depends on `react-lua`'s
+     internals published under `@rbxts-js`), and the compiled package itself, mounted *as if* it were just
+     another dependency under its own scope. A package's output is relocatable precisely because roblox-ts
+     emits it `script`-relative, so this is what lets `import { X } from "@rbxts/whatever"` resolve with no
+     `default.project.json` at all (library packages like `@rbxts/react-clean-ui` usually don't have one).
+3. Builds that project into a place file with `rojo build` (`lunit.studio.buildPlaceCommand`, where
+   `${projectFile}` is whichever project step 2 chose).
 4. Generates the bootstrap script (also in this extension's storage directory, always regenerated) that
-   walks the synced tree for `*.test`/`*.spec` ModuleScripts and runs each one (leaving out `@Tag("Lune")`
+   walks the built place for `*.test`/`*.spec` ModuleScripts and runs each one (leaving out `@Tag("Lune")`
    tests -- see [Choosing Lune vs. Studio per test](#choosing-lune-vs-studio-per-test)), and launches Studio
-   against it.
+   against it. Nothing is injected into the place itself: Studio runs the script via `--runScriptFile`.
 
 Notes:
 - On Windows, `RobloxStudioBeta.exe` is auto-detected under `%LOCALAPPDATA%\Roblox\Versions`. On other
@@ -258,9 +265,9 @@ Notes:
   increase it if results seem to lag one run behind your latest edit.
 - **Rojo required, roblox-ts required**: `rojo build` and `node_modules/roblox-ts/include` must both be
   available; this is virtually always already true for a roblox-ts project.
-- If you override `lunit.studio.buildPlaceCommand` to point at your own Rojo project instead (e.g. because a
-  test needs your real game's services/config), the auto-generated bootstrap script's tree-shape assumptions
-  won't match it -- point `lunit.studio.bootstrapScript` at your own script too in that case.
+- To run a *package's* tests against your real game's place instead (e.g. because a test needs its
+  services/config), set `lunit.studio.rojoProject` to that project file: the bootstrap script searches the
+  whole built place for tests, so no other change is needed. A game project already does this by default.
 - **Bootstrapping detail worth knowing if you read `src/bootstrapTemplate.ts`**: roblox-ts compiled modules
   all start with `local TS = _G[script]`, which is only populated as a side effect of loading a module
   *through* `TS.import`/`TS.getModule` -- a bare `require()` on a roblox-ts-compiled ModuleScript leaves that
@@ -291,6 +298,21 @@ The rule is enforced at both ends:
 Studio yields a frame between test classes at least every 50 ms, so a long run doesn't freeze it. In
 live-sync mode the run also stops starting new classes once `lunit.studio.liveSync.timeoutSeconds` has
 passed, because by then VS Code has stopped waiting for results.
+
+**"A plugin is taking a long time to run. Do you want to stop it?"** -- Studio shows this popup when one
+script runs without yielding for longer than its script timeout (10 seconds by default). The total run
+length isn't the trigger; a run of several minutes that yields regularly never shows it. The Studio runner
+only yields *between* test classes, and lunit doesn't yield between synchronous tests, so a single class of
+CPU-bound tests (or one test that computes for more than 10 seconds) can trip it. Answering **No** lets the
+run continue, but the popup returns on the next long stretch. To prevent it:
+
+- In Studio, open **File > Studio Settings > Studio** and raise **Script Timeout Length**, or set it to `0`
+  to disable the check. This is the only fix for a single test that runs longer than the timeout.
+- Or keep the heavy tests out of Studio: tag them with one of `lunit.lune.slowTags` (see
+  [Slow tests and the Full profile](#slow-tests-and-the-full-profile)) or with `@Tag("Lune")`, and run them
+  with the Lune profile instead.
+- Or make the long tests yield: a `task.wait()` inside a long-running test gives Studio a frame and resets
+  its timer.
 
 ```ts
 import { Test, Tag } from "@rbxts/lunit";

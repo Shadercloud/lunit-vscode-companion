@@ -598,7 +598,9 @@ async function runStandalone(
 	}
 	const records = parseResultLines(outcome.output);
 	const results: TestResultEntry[] = leaves.map((leaf) => ({ ...identityOnly(leaf), ...resolveVerdict(leaf, records, outcome) }));
-	return withSlowCount(buildSummary(args.via, results, false));
+	// A run that could not start at all (no place to build, say) is exit code
+	// 2, the same as any other reason the run could not be performed.
+	return withSlowCount(buildSummary(args.via, results, false, records.length === 0 ? outcome.error : undefined));
 }
 
 function identityOnly(leaf: DiscoveredLeaf): TestIdentity {

@@ -71,7 +71,21 @@ export interface LunitConfig {
 	studio: {
 		enabled: boolean;
 		executablePath: string;
+		/**
+		 * The place-building command with every token but `${projectFile}`
+		 * resolved: which Rojo project it builds is decided per run (the
+		 * project's own for a roblox-ts game project, the generated
+		 * `projectFile` for a package) -- see studioProjectKind.ts and
+		 * `resolveBuildPlaceCommand`.
+		 */
 		buildPlaceCommand: string;
+		/**
+		 * `lunit.studio.rojoProject`: the project's own Rojo file to build the
+		 * standalone test place from. Empty means "work it out": the compile
+		 * command's `--rojo` flag, else the compiled output (studioProjectKind.ts).
+		 */
+		rojoProject: string;
+		/** The generated, self-contained Rojo project for a package project's test place. */
 		projectFile: string;
 		placeFile: string;
 		bootstrapScript: string;
@@ -140,7 +154,9 @@ export function buildConfig(root: string, storageDir: string, get: SettingReader
 	const projectFile = resolveTokens(get<string>('studio.projectFile', '${storageDir}/studio-test.project.json'), baseTokens);
 	const placeFile = resolveTokens(get<string>('studio.placeFile', '${storageDir}/test-place.rbxl'), baseTokens);
 
-	const studioTokens = { ...baseTokens, projectFile, placeFile };
+	// `${projectFile}` is deliberately left in buildPlaceCommand: which Rojo
+	// project it names is decided per run (resolveBuildPlaceCommand).
+	const studioTokens = { ...baseTokens, placeFile };
 
 	return {
 		workspaceRoot: root,
@@ -170,6 +186,7 @@ export function buildConfig(root: string, storageDir: string, get: SettingReader
 				get<string>('studio.buildPlaceCommand', 'npx rojo build "${projectFile}" --output "${placeFile}"'),
 				studioTokens,
 			),
+			rojoProject: resolveTokens(get<string>('studio.rojoProject', ''), baseTokens),
 			projectFile,
 			placeFile,
 			bootstrapScript: resolveTokens(get<string>('studio.bootstrapScript', '${storageDir}/studio-bootstrap.luau'), studioTokens),
@@ -184,4 +201,9 @@ export function buildConfig(root: string, storageDir: string, get: SettingReader
 			},
 		},
 	};
+}
+
+/** The place-building command for one run, naming the Rojo project it builds. */
+export function resolveBuildPlaceCommand(buildPlaceCommand: string, projectFile: string): string {
+	return resolveTokens(buildPlaceCommand, { projectFile });
 }
