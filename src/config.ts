@@ -91,6 +91,8 @@ export interface LunitConfig {
 		bootstrapScript: string;
 		outputFile: string;
 		quitAfterExecution: boolean;
+		/** Whether the installed Studio plugin prints its status lines (discovery, connecting); baked in at install. */
+		debug: boolean;
 		timeoutSeconds: number;
 		liveSync: {
 			enabled: boolean;
@@ -192,6 +194,7 @@ export function buildConfig(root: string, storageDir: string, get: SettingReader
 			bootstrapScript: resolveTokens(get<string>('studio.bootstrapScript', '${storageDir}/studio-bootstrap.luau'), studioTokens),
 			outputFile: resolveTokens(get<string>('studio.outputFile', '${storageDir}/studio-output.log'), studioTokens),
 			quitAfterExecution: get<boolean>('studio.quitAfterExecution', true),
+			debug: get<boolean>('studio.debug', false),
 			timeoutSeconds: get<number>('studio.timeoutSeconds', 180),
 			liveSync: {
 				enabled: get<boolean>('studio.liveSync.enabled', true),

@@ -168,7 +168,7 @@ export function isStudioPluginInstalled(): boolean {
 export type InstallPluginResult = { installedPath: string } | { error: string };
 
 /** Regenerates and (re)installs the companion Studio plugin -- see studioPluginTemplate.ts. */
-export function installStudioPlugin(port: number): InstallPluginResult {
+export function installStudioPlugin(port: number, debug = false): InstallPluginResult {
 	const pluginsDir = getStudioPluginsDir();
 	if (!pluginsDir) {
 		return {
@@ -179,7 +179,7 @@ export function installStudioPlugin(port: number): InstallPluginResult {
 		fs.mkdirSync(pluginsDir, { recursive: true });
 		fs.rmSync(path.join(pluginsDir, STALE_PLUGIN_ICON_FILE_NAME), { force: true });
 		const pluginPath = path.join(pluginsDir, PLUGIN_FILE_NAME);
-		fs.writeFileSync(pluginPath, buildStudioPluginScript(port), 'utf8');
+		fs.writeFileSync(pluginPath, buildStudioPluginScript(port, debug), 'utf8');
 		return { installedPath: pluginPath };
 	} catch (err) {
 		return { error: `Failed to write the plugin file: ${String(err)}` };

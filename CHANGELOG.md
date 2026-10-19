@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.0
+
+### Added
+
+- **`lunit.studio.debug`** (default `false`): the Studio plugin no longer prints its status lines
+  ("Connecting automatically...", "Looking for VS Code workspaces...", "Automatically selected VS Code: ...",
+  "Bridge started/stopped" and the like) to Studio's Output window unless this is on. Studio runs a copy of
+  every plugin in each Play server and client, so these lines used to repeat on every Play. A startup scan
+  that finds no VS Code window (a Play client, or a Studio window without the extension) no longer warns
+  either; a **Refresh** that finds nothing still does, and real failures (a selected window that cannot be
+  reached, a bridge error) always warn. The setting is baked into the plugin file: changing it rewrites the
+  installed plugin, and Studio picks it up after a restart or a plugin reload.
+
 ## 0.7.1
 
 ### Fixed

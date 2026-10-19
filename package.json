@@ -2,7 +2,7 @@
   "name": "vscode-lunit-companion",
   "displayName": "Lunit Test Companion",
   "description": "Discover and run @rbxts/lunit tests from VS Code's Test Explorer.",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "publisher": "ShaderCloud",
   "author": "ShaderCloud",
   "license": "MIT",
@@ -203,6 +203,11 @@
           "type": "string",
           "default": "${storageDir}/studio-output.log",
           "description": "File Roblox Studio writes script output to (--outputFile), which is parsed for pass/fail results. Lives in this extension's per-workspace storage, outside your project, by default."
+        },
+        "lunit.studio.debug": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Print the Studio plugin's status lines to Studio's Output window (looking for VS Code workspaces, connecting, selecting a window), including in each Play server and client. Off, the plugin stays silent unless something goes wrong. Changing it rewrites the installed plugin; restart Studio (or reload the plugin) to pick it up."
         },
         "lunit.studio.quitAfterExecution": {
           "type": "boolean",

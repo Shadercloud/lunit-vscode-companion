@@ -23,7 +23,12 @@
  */
 import { buildStudioPickerScript } from './studioPickerTemplate';
 const TOOLBAR_ICON = 'rbxassetid://14098599607';
-export function buildStudioPluginScript(port: number): string {
+/**
+ * `debug` (the `lunit.studio.debug` setting, baked in at install) shows the
+ * bridge's status lines in Studio's Output: discovery, connecting, selecting.
+ * Off, the bridge stays silent unless something goes wrong.
+ */
+export function buildStudioPluginScript(port: number, debug = false): string {
 	return `--!strict
 -- Lunit Studio Bridge -- installed by the "Lunit: Install Roblox Studio
 -- Plugin" VS Code command. Safe to reinstall/overwrite at any time; re-run
@@ -32,6 +37,11 @@ export function buildStudioPluginScript(port: number): string {
 local HttpService = game:GetService("HttpService")
 
 local BASE_PORT = ${port}
+local DEBUG = ${debug ? 'true' : 'false'}
+
+local function debugPrint(message: string)
+	if DEBUG then print(message) end
+end
 local POLL_INTERVAL_SECONDS = 1.5
 
 local toolbar = plugin:CreateToolbar("Lunit")
@@ -47,7 +57,7 @@ local selectButton = toolbar:CreateButton("LunitOpenConnection", "Open Lunit bri
 selectButton.ClickableWhenViewportHidden = true
 ${buildStudioPickerScript()}
 
-print("[lunit] Connecting automatically. Click Lunit to manage the bridge connection.")
+debugPrint("[lunit] Connecting automatically. Click Lunit to manage the bridge connection.")
 
 local function runJob(code: string): string
 	local fn, compileErr = loadstring(code)

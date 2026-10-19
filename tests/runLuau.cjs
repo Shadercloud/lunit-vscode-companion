@@ -16,14 +16,19 @@ async function main() {
 		fs.writeFileSync(script, buildLiveSyncJobScript());
 		const plugin = path.join(dir, 'plugin.luau');
 		fs.writeFileSync(plugin, buildStudioPluginScript(34873));
+		const debugPlugin = path.join(dir, 'plugin-debug.luau');
+		fs.writeFileSync(debugPlugin, buildStudioPluginScript(34873, true));
 		const result = spawnSync(process.env.LUNE_EXE || 'lune', ['run', 'tests/liveSync.luau', script, plugin], { stdio: 'inherit' });
 		if (result.error) throw result.error;
 		if (result.status !== 0) return result.status ?? 1;
-		for (const scenario of ['', 'cancel-startup', 'slow-unused-ports', 'remembered-workspace', 'remembered-unavailable', 'panel-layout-owned']) {
+		for (const scenario of ['', 'cancel-startup', 'slow-unused-ports', 'remembered-workspace', 'remembered-unavailable', 'panel-layout-owned', 'quiet-startup']) {
 			const selection = spawnSync(process.env.LUNE_EXE || 'lune', ['run', 'tests/pluginSelection.luau', plugin, scenario], { stdio: 'inherit' });
 			if (selection.error) throw selection.error;
 			if (selection.status !== 0) return selection.status ?? 1;
 		}
+		const debugRun = spawnSync(process.env.LUNE_EXE || 'lune', ['run', 'tests/pluginSelection.luau', debugPlugin, 'debug-startup'], { stdio: 'inherit' });
+		if (debugRun.error) throw debugRun.error;
+		if (debugRun.status !== 0) return debugRun.status ?? 1;
 		require('./slowFilter.cjs')(dir);
 		require('./studioTags.cjs')(dir);
 		await require('./studioGame.cjs')(dir);

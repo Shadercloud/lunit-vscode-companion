@@ -41,7 +41,10 @@ The previous window's status can take up to five seconds to expire after switchi
 
 Each window automatically takes a free port in `34873`–`34892`. To use another discovery range, set
 `lunit.studio.liveSync.port`, reload VS Code, then reinstall and reload the plugin to match.
-All windows you want to discover should use the same range. The CLI discovers the window containing
+All windows you want to discover should use the same range.
+The plugin keeps Studio's Output quiet unless something goes wrong; set `lunit.studio.debug` to `true`
+to see its status lines (discovery, connecting, selecting). Changing it rewrites the installed plugin;
+restart Studio or reload the plugin to pick it up. The CLI discovers the window containing
 its working directory; if multiple windows contain the same project, use `--port` to choose one.
 Upgrade both the extension and Studio plugin for the picker: older plugins still poll only the base
 port, and older extensions do not appear in the picker. Rojo syncing uses a separate connection.

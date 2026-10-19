@@ -10,6 +10,7 @@ local stale = false
 local delivered = false
 local expectedPort = 34873
 local warnings = {}
+local prints = {}
 local objects = {}
 local discoveryDelay = 0.15
 local noWorkspaces = false
@@ -21,6 +22,10 @@ local scenario = process.args[2]
 if scenario == 'remembered-workspace' then
  savedSettings.LunitSelectedWorkspace = '/project34874'
  expectedPort = 34874
+elseif scenario == 'quiet-startup' or scenario == 'debug-startup' then
+ -- No VS Code is open: what a Play copy of the plugin, or a Studio window
+ -- without the extension, sees at startup.
+ noWorkspaces = true
 elseif scenario == 'remembered-unavailable' then
  savedSettings.LunitSelectedWorkspace = '/unavailable-project'
 end
@@ -112,7 +117,7 @@ local environment = {
  Instance = {new = newObject}, Enum = roblox.Enum, Color3 = roblox.Color3, UDim2 = roblox.UDim2, UDim = roblox.UDim,
  DockWidgetPluginGuiInfo = {new = function(...) return {...} end},
  game = {GetService = function() return http end, PlaceId = 0, Name = 'Test Place'},
- plugin = plugin, task = task, print = function() end, warn = function(message) table.insert(warnings, message) end,
+ plugin = plugin, task = task, print = function(message) table.insert(prints, message) end, warn = function(message) table.insert(warnings, message) end,
  loadstring = function(code) return luau.load(code) end,
 }
 luau.load(fs.readFile(process.args[1]), {environment = environment, injectGlobals = true})()
@@ -128,6 +133,28 @@ if scenario == 'remembered-workspace' or scenario == 'remembered-unavailable' th
  assert(#calls > 20, 'restored selection must poll')
  unloading()
  print('Remembered workspace startup regression checks passed: ' .. scenario)
+ process.exit(0)
+end
+if scenario == 'quiet-startup' then
+ task.wait(0.3)
+ assert(find('DiscoveryStatus').Text:find('No workspaces found', 1, true), 'empty results must still show in the panel')
+ assert(#prints == 0, 'without debug, startup must print nothing: ' .. table.concat(prints, '\n'))
+ assert(#warnings == 0, 'without debug, an empty startup scan must not warn: ' .. table.concat(warnings, '\n'))
+ find('RefreshWorkspaces').Activated.fire()
+ task.wait(0.3)
+ assert(#warnings == 1 and warnings[1]:find('No compatible workspaces', 1, true), 'a Refresh that finds nothing must warn')
+ assert(#prints == 0, 'without debug, a Refresh must print nothing')
+ unloading()
+ print('Quiet startup regression checks passed')
+ process.exit(0)
+end
+if scenario == 'debug-startup' then
+ task.wait(0.3)
+ assert(table.concat(prints, '\n'):find('Connecting automatically', 1, true), 'debug must print the startup line')
+ assert(table.concat(prints, '\n'):find('Looking for VS Code workspaces', 1, true), 'debug must print discovery')
+ assert(#warnings == 1 and warnings[1]:find('No compatible workspaces', 1, true), 'debug must report an empty startup scan')
+ unloading()
+ print('Debug startup regression checks passed')
  process.exit(0)
 end
 if scenario == 'panel-layout-owned' then

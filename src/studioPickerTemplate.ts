@@ -118,7 +118,7 @@ startStopButton.Activated:Connect(function()
 	running = not running
 	connectionWarning = false
 	updateConnectionStatus()
-	print(running and "[lunit] Bridge started." or "[lunit] Bridge stopped.")
+	debugPrint(running and "[lunit] Bridge started." or "[lunit] Bridge stopped.")
 end)
 local function addWorkspace(target, order)
 	local row = ui("Frame", "WorkspaceRow", {Size = UDim2.new(1, -6, 0, 44), AutomaticSize = Enum.AutomaticSize.Y,
@@ -139,7 +139,7 @@ local function addWorkspace(target, order)
 		running = true
 		connectionWarning = false
 		updateConnectionStatus()
-		print("[lunit] Selected VS Code: " .. target.label)
+		debugPrint("[lunit] Selected VS Code: " .. target.label)
 	end)
 	updateConnectionStatus()
 end
@@ -149,12 +149,13 @@ local function refreshWorkspaces()
 	for _, entry in rows do entry.frame:Destroy() end
 	rows = {}
 	discoveryLabel.Text = "Looking for VS Code workspaces..."
-	print("[lunit] Looking for VS Code workspaces...")
+	debugPrint("[lunit] Looking for VS Code workspaces...")
 	local pending = math.min(${BRIDGE_PORT_COUNT}, 65536 - BASE_PORT)
 	local found = 0
 	local lastError = ""
 	local function finish(timedOut)
 		if not alive or generation ~= discoveryGeneration then return end
+		local automatic = startupAutoConnect
 		if startupAutoConnect then
 			startupAutoConnect = false
 			-- Use the first VS Code window in port order, not the fastest HTTP
@@ -174,13 +175,17 @@ local function refreshWorkspaces()
 				running = true
 				connectionWarning = false
 				updateConnectionStatus()
-				print("[lunit] Automatically selected VS Code: " .. first.label)
+				debugPrint("[lunit] Automatically selected VS Code: " .. first.label)
 			end
 		end
 		if found == 0 then
 			discoveryLabel.Text = "No workspaces found. Open your project with the updated Lunit extension, then Refresh. See Output for details."
 			if timedOut and lastError == "" then lastError = "Discovery reached its time limit." end
-			warn("[lunit] No compatible workspaces found on ports " .. tostring(BASE_PORT) .. "–" .. tostring(BASE_PORT + ${BRIDGE_PORT_COUNT - 1}) .. ". " .. lastError)
+			-- Startup discovery runs in every Studio window and Play copy, most with
+			-- no VS Code to find, so it only reports this in debug; a Refresh does.
+			if DEBUG or not automatic then
+				warn("[lunit] No compatible workspaces found on ports " .. tostring(BASE_PORT) .. "–" .. tostring(BASE_PORT + ${BRIDGE_PORT_COUNT - 1}) .. ". " .. lastError)
+			end
 		else
 			-- Unused discovery ports may time out. That does not indicate a
 			-- problem with a workspace we successfully found or connected to.
@@ -240,7 +245,7 @@ local function showPanel()
 	root.Parent = replacement
 	widget = replacement
 	widget.Enabled = true
-	print("[lunit] Opened the Lunit panel with a layout specific to this Studio window.")
+	debugPrint("[lunit] Opened the Lunit panel with a layout specific to this Studio window.")
 end
 selectButton.Click:Connect(function()
 	-- Show the panel before starting any network request, including during a run.

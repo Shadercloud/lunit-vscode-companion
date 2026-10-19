@@ -125,14 +125,33 @@ function getStorageDir(folder: vscode.WorkspaceFolder): string {
 
 async function installPluginInteractive(): Promise<void> {
 	const folder = vscode.workspace.workspaceFolders?.[0];
-	const port = folder ? getConfig(folder, getStorageDir(folder)).studio.liveSync.port : 34873;
-	const result = installStudioPlugin(port);
+	const studio = folder ? getConfig(folder, getStorageDir(folder)).studio : undefined;
+	const result = installStudioPlugin(studio?.liveSync.port ?? 34873, studio?.debug ?? false);
 	if ('error' in result) {
 		vscode.window.showErrorMessage(`Lunit: ${result.error}`);
 		return;
 	}
 	vscode.window.showInformationMessage(
 		`Lunit: installed the Roblox Studio live-sync plugin to ${result.installedPath}. To activate the update without closing Studio, enable Plugin Debugging Enabled in Studio settings, replace the LunitStudioBridge script in PluginDebugService with this file, then right-click its plugin and choose Save and Reload Plugin. Writing the file alone does not update an already-loaded bridge.`,
+	);
+}
+
+/**
+ * `lunit.studio.debug` is baked into the plugin file, so a change rewrites
+ * the installed plugin. Studio keeps running the copy it loaded until the
+ * plugin is reloaded or Studio restarts.
+ */
+function reinstallPluginForDebug(): void {
+	const folder = vscode.workspace.workspaceFolders?.[0];
+	const studio = folder ? getConfig(folder, getStorageDir(folder)).studio : undefined;
+	const debug = studio?.debug ?? false;
+	const result = installStudioPlugin(studio?.liveSync.port ?? 34873, debug);
+	if ('error' in result) {
+		vscode.window.showErrorMessage(`Lunit: ${result.error}`);
+		return;
+	}
+	vscode.window.showInformationMessage(
+		`Lunit: Studio plugin debug messages turned ${debug ? 'on' : 'off'}. Restart Roblox Studio (or reload the Lunit plugin) to pick it up.`,
 	);
 }
 
@@ -324,6 +343,9 @@ export function activate(context: vscode.ExtensionContext): void {
 			}
 			if (e.affectsConfiguration('lunit.explorer')) {
 				void discoverAll(controller);
+			}
+			if (e.affectsConfiguration('lunit.studio.debug') && isStudioPluginInstalled()) {
+				reinstallPluginForDebug();
 			}
 		}),
 	);
