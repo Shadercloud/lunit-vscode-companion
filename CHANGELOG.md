@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.1
+
+### Fixed
+
+- **High CPU in WMI Provider Host (`WmiPrvSE.exe`) on Windows.** The status bar checked for `rojo serve` every
+  2 seconds by starting PowerShell and querying WMI, with a 1.5 s timeout. When WMI was slow, the killed
+  PowerShell left its query running and new ones piled up, more so with several VS Code windows open. The
+  result is now cached for 15 seconds, only one check runs at a time, a cheap `tasklist` runs first and WMI
+  is only asked for the command line when a `rojo.exe` exists.
+
 ## 0.8.0
 
 ### Added
