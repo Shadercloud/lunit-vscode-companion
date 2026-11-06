@@ -6,6 +6,7 @@ import { DEFAULT_LIVE_SYNC_PORT } from './config';
 import { getConfig } from './vscodeConfig';
 import { DiscoveredClass, parseTestFile } from './discovery';
 import { CliRunRequest, LiveSyncBridge } from './liveSyncBridge';
+import { isRobloxStudioRunning } from './studioProcess';
 import { buildTestSelection } from './luauTestFilterTemplate';
 import { LuneRunOutcome, RunOutcome, runViaLune } from './luneRunner';
 import {
@@ -20,6 +21,7 @@ import { isRojoServeRunning } from './rojoDetect';
 import {
 	BlockReport,
 	buildSummary,
+	formatTestLines,
 	LuneRunReport,
 	matchesFilters,
 	resolveBlockVerdict,
@@ -34,6 +36,7 @@ import {
 	Verdict,
 } from './runReport';
 import { TestRef } from './luneBlocks';
+import { LiveResults } from './liveResults';
 import { CancelSignal } from './cancelSignal';
 import { writeCliLauncher } from './cliLauncher';
 import {
@@ -41,6 +44,7 @@ import {
 	isStudioPluginInstalled,
 	regenerateStudioFiles,
 	runViaStudio,
+	StudioLiveHooks,
 } from './studioRunner';
 
 interface TestMeta {
@@ -205,6 +209,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	// Explorer click takes -- so it produces identical verdicts and the run
 	// shows up in the Testing view as well.
 	liveSyncBridge.runHandler = (request, onOutput, cancel) => runFromCli(controller, request, onOutput, cancel);
+	liveSyncBridge.studioRunning = isRobloxStudioRunning;
 	liveSyncBridge.start();
 	context.subscriptions.push({ dispose: () => liveSyncBridge?.stop() });
 
@@ -955,33 +960,77 @@ async function executeRun(
 		return report && report.blocks.length > 0 ? { ...summary, lune: summarizeReport(report) } : summary;
 	}
 
-	for (const leaf of leaves) {
-		run.started(leaf);
-	}
-
 	// A whole-tree run lets the Studio side run everything its tag rule allows;
 	// an explicit selection is narrowed to exactly the requested tests there.
 	const selection = request.include ? buildTestSelection(identities) : undefined;
 
+	// Live-sync streams each test's start and result (liveResults.ts): items
+	// move from queued to running to their verdict as Studio reports them, and
+	// a CLI run prints each result line as it comes. Build-and-launch reports
+	// only at the end, so there every item is marked running up front.
+	const known: { leaf: vscode.TestItem; identity: TestIdentity }[] = [];
+	const unknown: vscode.TestItem[] = [];
+	for (const leaf of leaves) {
+		const identity = identityOf(leaf);
+		if (identity) {
+			known.push({ leaf, identity });
+		} else {
+			unknown.push(leaf);
+		}
+	}
+	const live = new LiveResults(known.map((entry) => entry.identity));
+	const liveHooks: StudioLiveHooks = {
+		event: (event) => {
+			for (const update of live.apply(event)) {
+				const { leaf, identity } = known[update.index];
+				if (update.kind === 'started') {
+					run.started(leaf);
+					continue;
+				}
+				applyVerdict(run, leaf, identity, update.verdict);
+				onOutput?.(formatTestLines({ ...identity, ...update.verdict }, folder.uri.fsPath).join('\n') + '\n');
+			}
+		},
+		standalone: () => {
+			for (const leaf of leaves) {
+				run.started(leaf);
+			}
+		},
+	};
+	// Settles every test once the run is over: streamed results stand unless
+	// the final report says otherwise (then it wins, and says so); nothing is
+	// reported twice.
+	const settle = (records: readonly ResultRecord[], fallback: (identity: TestIdentity) => Verdict): TestResultEntry[] => [
+		...known.map(({ leaf, identity }, index) => {
+			const reconciled = live.reconcile(index, records, fallback(identity));
+			if (reconciled.report) {
+				applyVerdict(run, leaf, identity, reconciled.verdict);
+			}
+			return { ...identity, ...reconciled.verdict, streamed: !reconciled.report };
+		}),
+		...unknown.map((leaf) => applyVerdict(run, leaf, undefined, undefined)),
+	];
+
 	let outcome: RunOutcome;
 	try {
-		outcome = await runViaStudio(config, token, chunkSink, liveSyncBridge, selection, slowFilter, selection ? identities.map((identity) => identity.file) : undefined);
+		outcome = await runViaStudio(config, token, chunkSink, liveSyncBridge, selection, slowFilter, selection ? identities.map((identity) => identity.file) : undefined, liveHooks);
 	} catch (err) {
 		const message = failRun(err);
-		const results = applyVerdicts(run, leaves, () => ({ status: 'errored', message }));
+		const results = settle([], () => ({ status: 'errored', message }));
 		endRun();
 		return withSlowCount(buildSummary(via, [...results, ...leftOutResults], false));
 	}
 	displayFilter.flush();
 
 	if (outcome.cancelled) {
-		const results = applyVerdicts(run, leaves, () => ({ status: 'skipped' }));
+		// Tests that reported keep their real results; the rest were not run.
+		const results = settle([], () => ({ status: 'skipped' }));
 		endRun();
 		return withSlowCount(buildSummary(via, [...results, ...leftOutResults], true));
 	}
 
 	const records = parseResultLines(outcome.output);
-	const results = applyVerdicts(run, leaves, (identity) => resolveVerdict(identity, records, outcome));
+	const results = settle(records, (identity) => resolveVerdict(identity, records, outcome));
 	endRun();
 	return withSlowCount(buildSummary(via, [...results, ...leftOutResults], false));
 }

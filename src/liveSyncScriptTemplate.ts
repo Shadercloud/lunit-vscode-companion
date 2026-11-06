@@ -1,5 +1,6 @@
 import { buildLuauEmitHelpers } from './luauEmitHelpers';
 import { buildLuauTestFilterHelpers, luauString, SlowTestFilter, TestSelection } from './luauTestFilterTemplate';
+import { LIVE_RESULT_MARKER, LIVE_START_MARKER } from './resultProtocol';
 
 export interface LiveSyncJobOptions {
 	/** Narrows the run to an explicit Test Explorer request; undefined runs everything. */
@@ -10,6 +11,8 @@ export interface LiveSyncJobOptions {
 	deadlineSeconds?: number;
 	/** One test module's load (with its imports) is abandoned after this long. */
 	loadTimeoutSeconds?: number;
+	/** A test that holds Studio at least this long gets a WARNING line; 0 turns the warning off. */
+	slowTestWarningSeconds?: number;
 	/**
 	 * ModuleScript names (file basenames without extension) holding the
 	 * selected tests. Other test modules are never loaded at all. Undefined
@@ -38,18 +41,27 @@ export function buildLiveSyncJobScript(options: LiveSyncJobOptions = {}): string
 		: 'nil';
 	return `--!strict
 local owner = ...
-if owner == nil or owner.protocol == nil then
+-- Protocol 3: the plugin streams owner.output and owner.currentTest in its
+-- heartbeats and provides owner.announce (see studioPluginTemplate.ts).
+if owner == nil or type(owner.protocol) ~= "number" or owner.protocol < 3 then
 	return "[lunit] ERROR: the loaded Studio bridge is outdated. Run Lunit: Install Roblox Studio Live-Sync Plugin in VS Code, then reload LunitStudioBridge in Studio (PluginDebugService > Save and Reload Plugin)."
 end
 ${buildLuauEmitHelpers()}
 ${buildLuauTestFilterHelpers('Lune', options.selection, options.slow)}
 local DEADLINE_SECONDS = ${Math.floor(seconds(options.deadlineSeconds, 30, 0))}
 local LOAD_TIMEOUT_SECONDS = ${seconds(options.loadTimeoutSeconds, 10, 0.05)}
+local SLOW_TEST_WARNING_SECONDS = ${seconds(options.slowTestWarningSeconds, 5, 0)}
 local SELECTED_MODULES = ${selected}
 local started = os.clock()
 local root = Instance.new("Folder")
 root.Name = "LunitRun"
 owner.root = root
+-- The plugin streams new lines from this buffer with each heartbeat, so a run
+-- VS Code has to release still keeps the results that came in before.
+owner.output = LUNIT_OUTPUT_BUFFER
+-- Reported in heartbeats: "loading" during setup, "tests" once test modules
+-- load and run. A silence in "tests" is read as a busy test, not a dead Studio.
+owner.phase = "loading"
 local copies, sources, cache, loading = {}, {}, {}, {}
 -- Modules being loaded, outermost first: names where a timed-out load stalled.
 local loadOrder = {}
@@ -92,7 +104,7 @@ end
 local pendingWaits = {}
 local watchdogThread = nil
 local function watchdog()
-	while next(pendingWaits) ~= nil do
+	while not closed and next(pendingWaits) ~= nil do
 		task.wait(0.05)
 		local now = os.clock()
 		for state, deadline in pendingWaits do
@@ -344,6 +356,49 @@ isolatedRequire = function(target)
 	if not ok then error(value, 0) end
 	return value
 end
+-- Per-test hooks for one class. Before each test (and @Each row) the job
+-- yields if it has held Studio past the yield budget, so the plugin can get a
+-- heartbeat out, then records the test as owner.currentTest and announces it:
+-- VS Code then knows a silence that follows is a busy test, not a dead Studio,
+-- and which test it is. After the test it warns when the test took long
+-- enough to matter.
+-- Both also stream a line (start, and this try's result) into the output the
+-- plugin sends with its heartbeats, so VS Code can tick each test off as it
+-- finishes. These lines are not printed, and the per-class result lines stay
+-- the final word.
+local LIVE_START_MARKER = "${LIVE_START_MARKER}"
+local LIVE_RESULT_MARKER = "${LIVE_RESULT_MARKER}"
+local function testHooks(className)
+	local testStarted = os.clock()
+	return {
+		onTestStart = function(label)
+			lunitYieldBetweenClasses()
+			owner.currentTest = className .. " > " .. tostring(label)
+			table.insert(LUNIT_OUTPUT_BUFFER, LIVE_START_MARKER .. lunitB64Encode(className) .. "\\t" .. lunitB64Encode(label))
+			testStarted = os.clock()
+			owner.currentTestStarted = testStarted
+			if type(owner.announce) == "function" then pcall(owner.announce) end
+		end,
+		onTestEnd = function(label, testResult)
+			local took = os.clock() - testStarted
+			owner.currentTest = nil
+			if type(testResult) == "table" then
+				local status = testResult.skipped and "skipped" or (testResult.passed and "passed" or "failed")
+				table.insert(LUNIT_OUTPUT_BUFFER, LIVE_RESULT_MARKER .. table.concat({
+					lunitB64Encode(className),
+					lunitB64Encode(testResult.label or label),
+					status,
+					tostring(math.floor((testResult.elapsedTimeMs or 0) + 0.5)),
+					testResult.errorMessage ~= nil and lunitB64Encode(testResult.errorMessage) or "",
+				}, "\\t"))
+			end
+			if SLOW_TEST_WARNING_SECONDS > 0 and took >= SLOW_TEST_WARNING_SECONDS then
+				log(string.format("WARNING: slow test %s > %s took %.1f s. A test that runs this long without yielding blocks Studio (and the bridge heartbeat); tag it Slow or make it yield. (lunit.studio.slowTestWarningSeconds)",
+					className, tostring(label), took))
+			end
+		end,
+	}
+end
 local loadSeconds, executionSeconds = 0, 0
 local ok, failure = xpcall(function()
 	log("isolation: Folder/ModuleScript trees; real services remain live. Tests must disconnect service events and dispose external resources in teardown.")
@@ -518,6 +573,7 @@ local ok, failure = xpcall(function()
 	local lunitLoaded, lunit = boundedLoad("@rbxts/lunit", runtime.import, copies[runtimes[1]], copies[framework])
 	if not lunitLoaded then error(lunit, 0) end
 	loadSeconds += os.clock() - loadStart
+	owner.phase = "tests"
 	local classesLeftOut, testsLeftOut, slowLeftOut = 0, 0, 0
 	for index, original in tests do
 		-- Whole-run watchdog: VS Code stops waiting a little after this, so
@@ -553,7 +609,8 @@ local ok, failure = xpcall(function()
 			if run then
 				local executionStart = os.clock()
 				local remaining = DEADLINE_SECONDS - (os.clock() - started)
-				local status, err = bounded(math.max(remaining, 0), lunitRunClass, lunit, cls, className)
+				local status, err = bounded(math.max(remaining, 0), lunitRunClass, lunit, cls, className, testHooks(className))
+				owner.currentTest = nil
 				executionSeconds += os.clock() - executionStart
 				if status == "timeout" then
 					log(string.format("ERROR: test class %s was still running at the %d s live-sync timeout and was cancelled (%s); %d test module(s) not run.",

@@ -109,7 +109,7 @@ end
 local expectedTests = 100
 local function run(expectError)
  local originalCount = #game:GetDescendants()
- local owner = {protocol = 2}
+ local owner = {protocol = 3}
  local fn = luau.load(code, {environment = environment, injectGlobals = true})
  local finished, succeeded, output = false, false, nil
  task.spawn(function()

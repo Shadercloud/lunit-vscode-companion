@@ -26,6 +26,12 @@ export interface RunOutcome {
 	 * command line exits with code 2 rather than 1.
 	 */
 	error?: string;
+	/**
+	 * Set when the run was released partway (live-sync): the verdict message for
+	 * every test that had not reported a result by then. Tests that did report
+	 * keep their own verdicts.
+	 */
+	unfinishedMessage?: string;
 }
 
 /**

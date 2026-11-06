@@ -2,7 +2,7 @@
   "name": "vscode-lunit-companion",
   "displayName": "Lunit Test Companion",
   "description": "Discover and run @rbxts/lunit tests from VS Code's Test Explorer.",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "publisher": "ShaderCloud",
   "author": "ShaderCloud",
   "license": "MIT",
@@ -222,6 +222,18 @@
           "type": "number",
           "default": 180,
           "description": "Kill the Studio process if it has not exited after this many seconds (safeguard in case Studio does not quit on its own)."
+        },
+        "lunit.studio.testTimeoutSeconds": {
+          "type": "number",
+          "default": 120,
+          "minimum": 1,
+          "description": "Live-sync: how long one test may keep Roblox Studio from sending its heartbeat (a synchronous test holds Studio's main thread) before the run is released as stuck. Results already in are kept, and the message names the test. A Studio that has really closed is still detected within about 15 seconds."
+        },
+        "lunit.studio.slowTestWarningSeconds": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "description": "Live-sync: print a warning for any test that takes at least this many seconds, so a test that blocks Studio gets noticed (tag it Slow or make it yield) before it causes trouble. 0 turns the warning off."
         },
         "lunit.studio.liveSync.enabled": {
           "type": "boolean",

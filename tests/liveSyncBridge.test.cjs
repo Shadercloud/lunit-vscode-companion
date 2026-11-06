@@ -18,6 +18,10 @@ async function fixture(t) {
   url,
   poll: async s => (await fetch(url + '/poll' + session(s))).json(),
   heartbeat: async (job, s) => (await fetch(`${url}/heartbeat?jobId=${job.jobId}${s ? `&session=${s}` : ''}`)).json(),
+  // A current plugin's heartbeat: progress plus newly streamed output lines.
+  progress: async (job, s, body) => (await fetch(`${url}/heartbeat?jobId=${job.jobId}&session=${s}`, {
+   method: 'POST', body: JSON.stringify({jobId: job.jobId, ...body}),
+  })).json(),
   cancelAll: async () => (await fetch(url + '/cancel', {method: 'POST'})).json(),
   result: async (job, output = 'done') => fetch(url + '/result', {
    method: 'POST', body: JSON.stringify({jobId: job.jobId, output}),
@@ -237,4 +241,93 @@ test('CLI prefers the most specific workspace and exposes duplicate-window ambig
  assert.deepEqual(matchingBridges([child], path.join(root, 'game-other')), []);
  const duplicate = bridge(3, path.join(root, 'game'));
  assert.deepEqual(matchingBridges([child, duplicate], path.join(root, 'game')), [child, duplicate]);
+});
+
+// --- A busy Studio is not a dead one (0.10.0) -------------------------------
+// Time is scaled: heartbeatTimeoutMs 100 ms stands for the 15 s heartbeat
+// timeout, testTimeoutMs for lunit.studio.testTimeoutSeconds.
+const { RESULT_MARKER, parseResultLines } = require('../out/resultProtocol');
+const { resolveVerdict } = require('../out/runReport');
+const { LiveSyncReleasedError } = require('../out/liveSyncBridge');
+const b64 = text => Buffer.from(text).toString('base64');
+const resultLine = (cls, label, status) => `${RESULT_MARKER}${b64(cls)}\t${b64(label)}\t${status}\t1\t`;
+
+test('a synchronous test that holds Studio past the heartbeat timeout completes, with no release', async t => {
+ const {bridge, poll, progress, result} = await fixture(t);
+ bridge.heartbeatTimeoutMs = 100;
+ bridge.studioRunning = async () => true;
+ const run = bridge.runJob('suite', 10000, undefined, {testTimeoutMs: 5000});
+ const job = await poll('studio');
+ // The plugin announces the test right before it blocks Studio...
+ await progress(job, 'studio', {phase: 'tests', test: 'PlacePreviewOracleTests > renders', testSeconds: 0, lines: []});
+ // ...then nothing arrives for 6x the heartbeat timeout (a 30 s+ block at scale).
+ await sleep(600);
+ assert.equal(bridge.hasActiveJob, true, 'a busy Studio must not be declared dead');
+ await result(job, resultLine('PlacePreviewOracleTests', 'renders', 'passed'));
+ assert.match(await run, /@@LUNIT_RESULT@@/);
+});
+
+test('a busy test with no process probe is still given the per-test allowance', async t => {
+ const {bridge, poll, progress, result} = await fixture(t);
+ bridge.heartbeatTimeoutMs = 100;
+ const run = bridge.runJob('suite', 10000, undefined, {testTimeoutMs: 5000});
+ const job = await poll('studio');
+ await progress(job, 'studio', {phase: 'tests', test: 'Slow > one', testSeconds: 0});
+ await sleep(400);
+ assert.equal(bridge.hasActiveJob, true);
+ await result(job);
+ assert.equal(await run, 'done');
+});
+
+test('a Studio that really closed mid-run is detected at the heartbeat timeout, keeping results already in', async t => {
+ const {bridge, poll, progress} = await fixture(t);
+ bridge.heartbeatTimeoutMs = 100;
+ bridge.studioRunning = async () => false;
+ const started = Date.now();
+ const run = bridge.runJob('suite', 10000, undefined, {testTimeoutMs: 60000});
+ const job = await poll('studio');
+ await progress(job, 'studio', {phase: 'tests', test: 'Second > b', testSeconds: 0.5, lines: [
+  resultLine('First', 'a', 'passed'), resultLine('First', 'c', 'failed'),
+ ]});
+ const err = await run.then(() => assert.fail('must be released'), e => e);
+ assert.ok(err instanceof LiveSyncReleasedError, String(err));
+ assert.match(err.message, /no longer running/);
+ assert.match(err.message, /Second > b/, 'the message names the test it stopped on');
+ assert.ok(Date.now() - started < 2000, 'detected quickly, not at the per-test limit');
+ assert.equal(bridge.hasActiveJob, false);
+ // Results that came in before the release keep their verdicts; the rest get the reason.
+ const records = parseResultLines(err.partialOutput);
+ const outcome = {code: 1, output: err.partialOutput, timedOut: false, cancelled: false, unfinishedMessage: err.unfinishedReason};
+ const verdict = (className, methodName) => resolveVerdict({file: 'x', className, methodName}, records, outcome);
+ assert.equal(verdict('First', 'a').status, 'passed');
+ assert.equal(verdict('First', 'c').status, 'failed');
+ assert.deepEqual(verdict('Second', 'b'), {status: 'errored', message: 'run released: Roblox Studio stopped running during Second > b'});
+});
+
+test('a test past lunit.studio.testTimeoutSeconds is released, named, with results kept', async t => {
+ const {bridge, poll, progress, result} = await fixture(t);
+ bridge.heartbeatTimeoutMs = 100;
+ bridge.studioRunning = async () => true;
+ const run = bridge.runJob('suite', 10000, undefined, {testTimeoutMs: 300});
+ const job = await poll('studio');
+ await progress(job, 'studio', {phase: 'tests', lines: [resultLine('Quick', 'x', 'passed')]});
+ await progress(job, 'studio', {phase: 'tests', test: 'Stuck > forever', testSeconds: 0});
+ const err = await run.then(() => assert.fail('must be released'), e => e);
+ assert.match(err.message, /last test it reported was Stuck > forever \(running \d+s/);
+ assert.match(err.message, /lunit\.studio\.testTimeoutSeconds/);
+ assert.match(err.unfinishedReason, /^run released after Stuck > forever ran 0s\+ without a heartbeat$/);
+ assert.equal(parseResultLines(err.partialOutput).length, 1);
+ // The next run starts cleanly.
+ const next = bridge.runJob('next', 5000);
+ await result(await poll('studio'));
+ assert.equal(await next, 'done');
+});
+
+test('outside the test phase a silent Studio with no process probe is released at the heartbeat timeout', async t => {
+ const {bridge, poll, progress} = await fixture(t);
+ bridge.heartbeatTimeoutMs = 100;
+ const run = bridge.runJob('suite', 10000, undefined, {testTimeoutMs: 60000});
+ const job = await poll('studio');
+ await progress(job, 'studio', {phase: 'loading'});
+ await assert.rejects(run, /stopped responding/);
 });

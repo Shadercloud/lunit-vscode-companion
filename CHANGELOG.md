@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.10.0
+
+A long, legitimate test no longer fails a whole Studio run as "Roblox Studio stopped responding". **Reinstall
+the Studio plugin** (Lunit: Install Roblox Studio Live-Sync Plugin, then restart Studio or reload the
+plugin): runs through a 0.9.0 plugin stop with "the loaded Studio bridge is outdated".
+
+### Fixed
+
+- **A busy Studio is told apart from a dead one.** A synchronous test holds Studio's main thread, so the
+  plugin's heartbeat cannot go out. In 0.9.0, any test over 15 s released the run and errored every
+  test. Now:
+  - The job announces each test (and `@Each` row) as it starts, and the plugin sends a heartbeat naming
+    it before the test begins.
+  - While a test is running, or while a Roblox Studio process is still running on the machine, the
+    silence may last **`lunit.studio.testTimeoutSeconds`** (new, default 120).
+  - A Studio that has actually closed (no Studio process) is still released at about 15 s, and so is a
+    Studio restart or plugin reload (new session id).
+  - The job also yields between tests, not just between classes, once it has held Studio for 50 ms, so
+    the heartbeat gets through between the cases of a long class.
+- **A released run keeps the results already in.** Heartbeats now stream the run's output. A run
+  released partway reports what had passed and failed by then, and errors only the unfinished tests, with
+  the reason (for example `run released after PlacePreviewOracleTests > renders ran 120s+ without a
+  heartbeat`), instead of "0 passed, N errored".
+- **The message names the culprit**: the last test Studio reported, and how long it had been running.
+- The plugin no longer abandons a job because a blocking test delayed its heartbeats; only heartbeats
+  that actually fail for 10 s count as VS Code being gone.
+
+### Added
+
+- **Studio results stream into the Test Explorer as each test finishes** (live-sync). A test now goes from
+  queued to running when Studio starts it and gets its verdict as soon as it finishes, instead of every
+  test spinning until the run ends. The plugin sends results in batches (every 250 ms or 50 lines) with
+  its heartbeat, with duration and failure message. `@Each` rows map to their test, which turns failed as
+  soon as one row fails, and a retried test shows its latest try. The end-of-run report is still the final
+  word: a result already shown is not reported again, and when the final report disagrees (a failure in
+  teardown after the test reported passed, say) the final result wins and its message says so. A run
+  that is cancelled, times out or loses Studio keeps every result that streamed in; a cancelled run
+  leaves the rest skipped, the others error the rest with the reason.
+- **`lunit-cli --studio` prints each result line as it arrives** (the same `PASS`/`FAIL` lines as before),
+  and the closing summary no longer repeats them. `--json` is unchanged; each entry gains `streamed: true`
+  when it was reported live.
+- **`lunit.studio.slowTestWarningSeconds`** (default 5, 0 to turn off): any live-sync test that takes this
+  long gets a `WARNING: slow test <class> > <test> took N s` line, so it can be tagged `Slow` or made to
+  yield before it causes trouble.
+
 ## 0.9.0
 
 A Studio live-sync run can no longer hang for good, and one that goes wrong no longer needs a restart of

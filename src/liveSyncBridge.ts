@@ -48,6 +48,45 @@ export interface CancelReport {
  */
 const SESSION_SWITCH_SILENCE_MS = 2500;
 
+/** `runJob` options. */
+export interface RunJobOptions {
+	/**
+	 * While the plugin reports the job running tests, a Studio still running
+	 * on this machine may go this long without a heartbeat (a synchronous test
+	 * holds its main thread) before the run is released. Default 120 s.
+	 */
+	testTimeoutMs?: number;
+	/** Each batch of output lines the plugin streams while the job runs (live results). */
+	onLines?: (lines: string[]) => void;
+}
+
+/**
+ * How `runJob` fails when the run had to be released partway (Studio silent
+ * or gone, the run timed out, or it was released by hand): carries the
+ * output the plugin had streamed so far, so results already in are kept.
+ */
+export class LiveSyncReleasedError extends Error {
+	constructor(
+		message: string,
+		/** Output lines streamed in heartbeats before the release, joined by newlines. */
+		readonly partialOutput: string,
+		/** Why the tests that never reported were not run to the end; the verdict for each of them. */
+		readonly unfinishedReason: string,
+	) {
+		super(message);
+	}
+}
+
+/** The job's state as its latest heartbeat reported it. */
+interface JobProgress {
+	/** "loading" | "tests" while the job runs; undefined before the first heartbeat. */
+	phase?: string;
+	/** The test running at the last heartbeat (class > label), if any. */
+	test?: string;
+	/** Date.now() when that test started, from the plugin's own clock. */
+	testStartedAt?: number;
+}
+
 /**
  * Local (127.0.0.1-only) HTTP server the companion Studio plugin
  * (studioPluginTemplate.ts) polls for on-demand test-run jobs. Deliberately
@@ -80,16 +119,31 @@ export class LiveSyncBridge {
 		/** The plugin session (one per loaded plugin) the job was delivered to. */
 		session?: string;
 		lastHeartbeat: number;
+		progress: JobProgress;
+		/** Output lines the plugin streamed with its heartbeats. */
+		partialLines: string[];
+		testTimeoutMs: number;
+		onLines?: (lines: string[]) => void;
 		resolve: (output: string) => void;
-		fail: (err: Error) => void;
+		/** Releases the job: fails the waiting run, keeping the output streamed so far. */
+		release: (message: string, unfinishedReason?: string) => void;
 	} | undefined;
 	private readonly cliRuns = new Set<CancelSource>();
 	/**
 	 * A delivered job whose plugin has sent no heartbeat for this long is
-	 * released: Studio was closed, crashed or restarted. Only applies to
-	 * plugins that report a session id (all current ones do).
+	 * released: Studio was closed, crashed or restarted -- unless the job is
+	 * busy running tests (then `testTimeoutMs` applies) or Studio is known to
+	 * still be running. Only applies to plugins that report a session id.
 	 */
 	heartbeatTimeoutMs = 15000;
+	/**
+	 * Whether a Roblox Studio process is running on this machine: true, false,
+	 * or undefined when that cannot be told. Installed by the extension and the
+	 * CLI (studioProcess.ts). It lets a heartbeat silence be read: Studio gone
+	 * means release now; Studio running means a blocking test, so wait.
+	 */
+	studioRunning: (() => Promise<boolean | undefined>) | undefined;
+	private probe: { at: number; value: boolean | undefined; pending?: Promise<void> } = { at: 0, value: undefined };
 	private jobCounter = 0;
 	private candidatePort = this.port;
 	private readonly instanceId = randomUUID();
@@ -164,7 +218,7 @@ export class LiveSyncBridge {
 	 * learns from its next heartbeat (`active: false`) and cancels it before
 	 * it polls again, so the next job never runs alongside the old one.
 	 */
-	runJob(code: string, timeoutMs: number, cancelSignal?: CancelSignal): Promise<string> {
+	runJob(code: string, timeoutMs: number, cancelSignal?: CancelSignal, options: RunJobOptions = {}): Promise<string> {
 		if (cancelSignal?.isCancellationRequested) {
 			return Promise.reject(new Error('cancelled'));
 		}
@@ -187,25 +241,19 @@ export class LiveSyncBridge {
 				clearInterval(watchdog);
 				fn();
 			};
+			const release = (message: string, unfinishedReason = message) => {
+				const lines = this.currentJob?.id === id ? this.currentJob.partialLines : [];
+				settle(() => reject(new LiveSyncReleasedError(message, lines.join('\n'), unfinishedReason)));
+			};
 
 			const timeoutHandle = setTimeout(() => {
-				settle(() =>
-					reject(
-						new Error(
-							`timed out after ${Math.round(timeoutMs / 1000)}s waiting for the Roblox Studio plugin to run the tests and report back; the run was released and Studio told to abandon the job`,
-						),
-					),
+				release(
+					`timed out after ${Math.round(timeoutMs / 1000)}s waiting for the Roblox Studio plugin to run the tests and report back; the run was released and Studio told to abandon the job`,
+					`the run timed out after ${Math.round(timeoutMs / 1000)}s before this test reported a result`,
 				);
 			}, timeoutMs);
 
-			const watchdog = setInterval(() => {
-				const job = this.currentJob;
-				if (job?.id === id && job.delivered && job.session && Date.now() - job.lastHeartbeat > this.heartbeatTimeoutMs) {
-					settle(() => reject(new Error(
-						`Roblox Studio stopped responding while running the tests (no plugin heartbeat for ${Math.round(this.heartbeatTimeoutMs / 1000)}s): it was probably closed, restarted, or its Lunit plugin reloaded. The run was released.`,
-					)));
-				}
-			}, Math.min(1000, Math.max(10, Math.floor(this.heartbeatTimeoutMs / 4))));
+			const watchdog = setInterval(() => this.checkHeartbeat(id), Math.min(1000, Math.max(10, Math.floor(this.heartbeatTimeoutMs / 4))));
 			watchdog.unref?.();
 
 			this.currentJob = {
@@ -213,8 +261,12 @@ export class LiveSyncBridge {
 				code,
 				delivered: false,
 				lastHeartbeat: Date.now(),
+				progress: {},
+				partialLines: [],
+				testTimeoutMs: options.testTimeoutMs ?? 120000,
+				onLines: options.onLines,
 				resolve: (output) => settle(() => resolve(output)),
-				fail: (err) => settle(() => reject(err)),
+				release,
 			};
 			cancelSub = cancelSignal?.onCancellationRequested(() => {
 				settle(() => reject(new Error('cancelled')));
@@ -237,8 +289,91 @@ export class LiveSyncBridge {
 	abandonCurrentJob(reason: string): boolean {
 		const job = this.currentJob;
 		if (!job) { return false; }
-		job.fail(new Error(reason));
+		job.release(reason);
 		return true;
+	}
+
+	/**
+	 * Reads a delivered job's heartbeat silence (see `heartbeatTimeoutMs`):
+	 * - Studio known gone (no Studio process) after `heartbeatTimeoutMs`: released.
+	 * - Busy -- the plugin reported the job running tests, or a Studio process is
+	 *   still running -- the silence may last `testTimeoutMs` (a synchronous test
+	 *   holds Studio's main thread); past that the run is released, naming the test.
+	 * - Otherwise `heartbeatTimeoutMs` of silence releases it, as before.
+	 */
+	private checkHeartbeat(id: string): void {
+		const job = this.currentJob;
+		if (job?.id !== id || !job.delivered || !job.session) { return; }
+		const now = Date.now();
+		const silence = now - job.lastHeartbeat;
+		if (silence <= this.heartbeatTimeoutMs) { return; }
+		const studio = this.studioProbe(now);
+		const { test, testStartedAt, phase } = job.progress;
+		const seconds = (ms: number) => Math.round(ms / 1000);
+		const culprit = test
+			? `${test} (running ${seconds(now - (testStartedAt ?? job.lastHeartbeat))}s when the run was released)`
+			: undefined;
+		if (studio === false) {
+			job.release(
+				`Roblox Studio is no longer running (no plugin heartbeat for ${seconds(silence)}s${culprit ? `; the last test it reported was ${culprit}` : ''}). The run was released.`,
+				`run released: Roblox Studio stopped running${test ? ` during ${test}` : ''}`,
+			);
+			return;
+		}
+		const busy = phase === 'tests' || studio === true;
+		// The probe's first answer takes a moment; give it a few seconds before
+		// reading an unexplained silence as a dead Studio.
+		if (!busy && studio === undefined && this.studioRunning && silence <= this.heartbeatTimeoutMs + 5000) { return; }
+		if (!busy) {
+			job.release(
+				`Roblox Studio stopped responding while running the tests (no plugin heartbeat for ${seconds(silence)}s): it was probably closed, restarted, or its Lunit plugin reloaded. The run was released.`,
+				`run released: no heartbeat from Roblox Studio for ${seconds(silence)}s`,
+			);
+			return;
+		}
+		if (silence > job.testTimeoutMs) {
+			const limit = seconds(job.testTimeoutMs);
+			job.release(
+				`Roblox Studio sent no heartbeat for ${seconds(silence)}s while running the tests${culprit ? `; the last test it reported was ${culprit}` : ''}. That is past lunit.studio.testTimeoutSeconds (${limit}s), so the run was released. A test that runs this long without yielding blocks Studio: tag it Slow or make it yield.`,
+				`run released after ${test ?? 'a test'} ran ${limit}s+ without a heartbeat`,
+			);
+		}
+	}
+
+	private recordProgress(job: NonNullable<LiveSyncBridge['currentJob']>, body: string): void {
+		let parsed: { phase?: unknown; test?: unknown; testSeconds?: unknown; lines?: unknown };
+		try {
+			parsed = JSON.parse(body);
+		} catch {
+			return;
+		}
+		if (Array.isArray(parsed.lines)) {
+			const lines = parsed.lines.filter((line): line is string => typeof line === 'string');
+			job.partialLines.push(...lines);
+			if (lines.length > 0 && job.onLines) {
+				try { job.onLines(lines); } catch { /* a consumer's error must not break the bridge */ }
+			}
+		}
+		const test = typeof parsed.test === 'string' ? parsed.test : undefined;
+		const testSeconds = typeof parsed.testSeconds === 'number' && Number.isFinite(parsed.testSeconds) ? parsed.testSeconds : 0;
+		job.progress = {
+			phase: typeof parsed.phase === 'string' ? parsed.phase : undefined,
+			test,
+			testStartedAt: test ? Date.now() - Math.max(0, testSeconds) * 1000 : undefined,
+		};
+	}
+
+	/** The cached `studioRunning` answer, refreshed in the background at most every 3 s. */
+	private studioProbe(now: number): boolean | undefined {
+		const probe = this.studioRunning;
+		if (!probe) { return undefined; }
+		if (now - this.probe.at > 3000 && !this.probe.pending) {
+			this.probe.pending = probe()
+				.then((value) => { this.probe = { at: Date.now(), value }; }, () => { this.probe = { at: Date.now(), value: undefined }; })
+				.finally(() => { this.probe.pending = undefined; });
+		}
+		// A stale answer (from before this silence) is not evidence either way.
+		return now - this.probe.at <= 6000 ? this.probe.value : undefined;
 	}
 
 	/** `lunit-cli --cancel` and the reset command: cancels CLI runs in flight and releases any held job. */
@@ -277,7 +412,10 @@ export class LiveSyncBridge {
 			// job can never report back, so release it now instead of at timeout.
 			if (held?.delivered && held.session && session && session !== held.session
 				&& Date.now() - held.lastHeartbeat > SESSION_SWITCH_SILENCE_MS) {
-				held.fail(new Error('Roblox Studio reconnected with a new plugin session (Studio restarted or the Lunit plugin reloaded) before the delivered job reported back. The run was released.'));
+				held.release(
+					'Roblox Studio reconnected with a new plugin session (Studio restarted or the Lunit plugin reloaded) before the delivered job reported back. The run was released.',
+					'run released: Roblox Studio restarted (or its Lunit plugin reloaded) before this test reported a result',
+				);
 			}
 			const job = this.currentJob;
 			if (job && !job.delivered) {
@@ -295,16 +433,23 @@ export class LiveSyncBridge {
 		// While a plugin executes a job it reports in about once a second. The
 		// answer tells it whether anyone still wants the job; when not, it
 		// cancels the job and cleans up before polling again.
-		if (req.method === 'GET' && url.pathname === '/heartbeat') {
-			this.lastPluginSeenAt = Date.now();
-			const job = this.currentJob;
-			const active = job !== undefined && job.delivered && job.id === url.searchParams.get('jobId');
-			if (job && active) {
-				job.lastHeartbeat = Date.now();
-				job.session ??= session;
-			}
-			res.setHeader('Content-Type', 'application/json');
-			res.end(JSON.stringify({ active }));
+		// A POST (current plugins) also carries the job's progress: its phase,
+		// the test running and for how long, and new output lines.
+		if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/heartbeat') {
+			let body = '';
+			req.on('data', (chunk: Buffer) => { body += chunk.toString('utf8'); });
+			req.on('end', () => {
+				this.lastPluginSeenAt = Date.now();
+				const job = this.currentJob;
+				const active = job !== undefined && job.delivered && job.id === url.searchParams.get('jobId');
+				if (job && active) {
+					job.lastHeartbeat = Date.now();
+					job.session ??= session;
+					if (body) { this.recordProgress(job, body); }
+				}
+				res.setHeader('Content-Type', 'application/json');
+				res.end(JSON.stringify({ active }));
+			});
 			return;
 		}
 

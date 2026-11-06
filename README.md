@@ -308,7 +308,19 @@ run: no module starts after it, and a test class still running then is cancelled
 only the test modules that hold the selected tests. If a run does go wrong, **Stop** in the Testing view,
 **Lunit: Cancel and Release the Roblox Studio Live-Sync Run** or `lunit-cli --cancel` frees it at once,
 and closing or restarting Studio frees it within seconds. You never need to reload VS Code or restart
-Studio to run again. See [Studio live-sync isolation](docs/live-sync.md).
+Studio to run again.
+
+In live-sync mode, results stream in as each test finishes: the Test Explorer ticks tests off while the
+run goes, and `lunit-cli --studio` prints each `PASS`/`FAIL` line as it arrives. The end-of-run report
+settles anything that differs.
+
+A long synchronous test is not mistaken for a dead Studio. Each test is announced to VS Code as it
+starts, so a test that holds Studio's main thread may go `lunit.studio.testTimeoutSeconds` (default 120)
+without a heartbeat; a Studio that has actually closed is still caught within about 15 s. If a run is
+released partway, the results already in keep their verdicts, only the unfinished tests are errored, and
+the message names the test it stopped on. Tests taking `lunit.studio.slowTestWarningSeconds` (default 5)
+or longer get a warning so you can tag them `Slow` or make them yield. See
+[Studio live-sync isolation](docs/live-sync.md).
 
 **"A plugin is taking a long time to run. Do you want to stop it?"** -- Studio shows this popup when one
 script runs without yielding for longer than its script timeout (10 seconds by default). The total run

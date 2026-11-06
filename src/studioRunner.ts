@@ -5,12 +5,12 @@ import { CancelSignal } from './cancelSignal';
 import { buildStudioBootstrapScript } from './bootstrapTemplate';
 import { LunitConfig, resolveBuildPlaceCommand } from './config';
 import { detectStudioProject, describeStudioProjectRemedy, StudioProjectDetection } from './studioProjectKind';
-import { LiveSyncBridge } from './liveSyncBridge';
+import { LiveSyncBridge, LiveSyncReleasedError } from './liveSyncBridge';
 import { buildLiveSyncJobScript, moduleNameForTestFile } from './liveSyncScriptTemplate';
 import { SlowTestFilter, TestSelection } from './luauTestFilterTemplate';
 import { RunOutcome } from './luneRunner';
 import { runCommand } from './processRunner';
-import { parseResultLines } from './resultProtocol';
+import { LiveEvent, parseLiveLine, parseResultLines } from './resultProtocol';
 import { isRojoServeRunning } from './rojoDetect';
 import { describeToolFailure } from './toolDiagnostics';
 import { buildStudioProjectFile, parsePackageName } from './studioProjectTemplate';
@@ -351,6 +351,16 @@ export function regenerateStudioFiles(
  * building a place and launching a new Studio process. No Play mode
  * required: plugins run continuously in Edit mode too.
  */
+/**
+ * Live results of a Studio run (live-sync only): each test start and result as
+ * Studio streams it (see liveResults.ts). `standalone` is called instead when
+ * the run goes the build-and-launch way, which reports only at the end.
+ */
+export interface StudioLiveHooks {
+	event(event: LiveEvent): void;
+	standalone?(): void;
+}
+
 /** VS Code waits this much longer than the live-sync timeout for the job's own report. */
 const LIVE_SYNC_REPORT_GRACE_SECONDS = 15;
 
@@ -362,6 +372,7 @@ async function runViaLiveSync(
 	selection: TestSelection | undefined,
 	slow: SlowTestFilter | undefined,
 	selectedFiles: readonly string[] | undefined,
+	live: StudioLiveHooks | undefined,
 ): Promise<RunOutcome> {
 	const selectedModules = selectedFiles ? new Set(selectedFiles.map(moduleNameForTestFile)) : undefined;
 	onOutput(
@@ -410,10 +421,20 @@ async function runViaLiveSync(
 				slow,
 				deadlineSeconds: config.studio.liveSync.timeoutSeconds,
 				loadTimeoutSeconds: config.studio.liveSync.loadTimeoutSeconds,
+				slowTestWarningSeconds: config.studio.slowTestWarningSeconds,
 				selectedModules: selectedModules ? [...selectedModules] : undefined,
 			}),
 			(config.studio.liveSync.timeoutSeconds + LIVE_SYNC_REPORT_GRACE_SECONDS) * 1000,
 			token,
+			{
+				testTimeoutMs: config.studio.testTimeoutSeconds * 1000,
+				onLines: live ? (lines) => {
+					for (const line of lines) {
+						const event = parseLiveLine(line);
+						if (event) { live.event(event); }
+					}
+				} : undefined,
+			},
 		);
 		onOutput(output + '\n');
 		const anyFailed = output.includes('[lunit] ERROR:') || parseResultLines(output).some((r) => r.status === 'failed');
@@ -422,6 +443,13 @@ async function runViaLiveSync(
 		const message = err instanceof Error ? err.message : String(err);
 		if (message === 'cancelled') {
 			return { code: null, output: '', timedOut: false, cancelled: true };
+		}
+		if (err instanceof LiveSyncReleasedError) {
+			// Released partway: keep every result Studio streamed before the
+			// release; only the tests that never reported get the reason.
+			const output = err.partialOutput ? `${err.partialOutput}\n` : '';
+			onOutput(`${output}\n[lunit] ${message}\n`);
+			return { code: 1, output: `${output}[lunit] ERROR: ${message}`, timedOut: false, cancelled: false, unfinishedMessage: err.unfinishedReason };
 		}
 		onOutput(`\n[lunit] ${message}\n`);
 		return { code: null, output: message, timedOut: message.includes('timed out'), cancelled: false };
@@ -450,18 +478,22 @@ export async function runViaStudio(
 	selection?: TestSelection,
 	slow?: SlowTestFilter,
 	selectedFiles?: readonly string[],
+	live?: StudioLiveHooks,
 ): Promise<RunOutcome> {
 	const cwd = config.workspaceRoot;
 	const studio = config.studio;
 
 	if (bridge && config.studio.liveSync.enabled && bridge.isPluginConnected) {
 		if (hasRojoProjectFile(cwd)) {
-			return runViaLiveSync(config, bridge, token, onOutput, selection, slow, selection ? selectedFiles : undefined);
+			return runViaLiveSync(config, bridge, token, onOutput, selection, slow, selection ? selectedFiles : undefined, live);
 		}
 		onOutput(
 			'[lunit] the Lunit Studio plugin is connected, but this project has no Rojo project file of its own (e.g. default.project.json) -- there\'s nothing here for "rojo serve" to serve, so the connected Studio instance is presumably showing some other project (or nothing). Building a standalone place and launching a new Studio process instead.\n',
 		);
 	}
+
+	// Build-and-launch reports only at the end: no live results.
+	live?.standalone?.();
 
 	if (!config.skipCompile) {
 		onOutput(`> ${config.compileCommand}\n`);

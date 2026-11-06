@@ -13,12 +13,24 @@
 export const RESULT_MARKER = '@@LUNIT_RESULT@@';
 
 /**
+ * Live-sync only (liveSyncScriptTemplate.ts): streamed while the run goes, so
+ * the Test Explorer and the CLI can report each test as it finishes.
+ * - `@@LUNIT_START@@<b64 class>\t<b64 label>`: a test (or `@Each` row) starts.
+ * - `@@LUNIT_LIVE@@` + the same fields as a result line: one try of a test
+ *   finished. A retried test streams one per try; the last one stands.
+ * The `@@LUNIT_RESULT@@` lines stay the final word (see liveResults.ts), and
+ * these never count as results in `parseResultLines`.
+ */
+export const LIVE_START_MARKER = '@@LUNIT_START@@';
+export const LIVE_RESULT_MARKER = '@@LUNIT_LIVE@@';
+
+/**
  * Lines meant for machines, not people: the per-test result lines here, and
  * the module listing / block summary lines of a parallel Lune run
  * (luneBlockProtocol.ts). Written out literally rather than imported so this
  * module stays free of a dependency cycle.
  */
-const HIDDEN_LINE = /@@LUNIT_(RESULT|MODULES|BLOCK)@@/;
+const HIDDEN_LINE = /@@LUNIT_(RESULT|MODULES|BLOCK|START|LIVE)@@/;
 
 /**
  * Wraps a "display this line" sink so `@@LUNIT_RESULT@@...` protocol lines
@@ -83,31 +95,60 @@ function stripLuauLocationPrefix(message: string): string {
 	return message.replace(/^\S+:\d+:\s*/, '');
 }
 
+/** The record in one line carrying `marker` and the five result fields, if it is one. */
+function parseRecordLine(line: string, marker: string): ResultRecord | undefined {
+	const idx = line.indexOf(marker);
+	if (idx === -1) {
+		return undefined;
+	}
+	const parts = line.slice(idx + marker.length).split('\t');
+	if (parts.length < 5) {
+		return undefined;
+	}
+	const [classB64, labelB64, status, elapsedStr, errorB64] = parts;
+	if (status !== 'passed' && status !== 'failed' && status !== 'skipped') {
+		return undefined;
+	}
+	return {
+		className: decodeBase64(classB64),
+		label: decodeBase64(labelB64),
+		status,
+		elapsedMs: Number(elapsedStr) || 0,
+		error: errorB64.length > 0 ? stripLuauLocationPrefix(decodeBase64(errorB64.trimEnd())) : undefined,
+	};
+}
+
 export function parseResultLines(output: string): ResultRecord[] {
 	const records: ResultRecord[] = [];
 	for (const line of output.split(/\r?\n/)) {
-		const idx = line.indexOf(RESULT_MARKER);
-		if (idx === -1) {
-			continue;
+		const record = parseRecordLine(line, RESULT_MARKER);
+		if (record) {
+			records.push(record);
 		}
-		const payload = line.slice(idx + RESULT_MARKER.length);
-		const parts = payload.split('\t');
-		if (parts.length < 5) {
-			continue;
-		}
-		const [classB64, labelB64, status, elapsedStr, errorB64] = parts;
-		if (status !== 'passed' && status !== 'failed' && status !== 'skipped') {
-			continue;
-		}
-		records.push({
-			className: decodeBase64(classB64),
-			label: decodeBase64(labelB64),
-			status,
-			elapsedMs: Number(elapsedStr) || 0,
-			error: errorB64.length > 0 ? stripLuauLocationPrefix(decodeBase64(errorB64)) : undefined,
-		});
 	}
 	return records;
+}
+
+/** One streamed live-sync event (see LIVE_START_MARKER / LIVE_RESULT_MARKER). */
+export type LiveEvent =
+	| { kind: 'started'; className: string; label: string }
+	| { kind: 'result'; record: ResultRecord };
+
+/** The live event in one output line, if it carries one. */
+export function parseLiveLine(line: string): LiveEvent | undefined {
+	const record = parseRecordLine(line, LIVE_RESULT_MARKER);
+	if (record) {
+		return { kind: 'result', record };
+	}
+	const idx = line.indexOf(LIVE_START_MARKER);
+	if (idx === -1) {
+		return undefined;
+	}
+	const [classB64, labelB64] = line.slice(idx + LIVE_START_MARKER.length).split('\t');
+	if (!classB64 || labelB64 === undefined) {
+		return undefined;
+	}
+	return { kind: 'started', className: decodeBase64(classB64), label: decodeBase64(labelB64.trimEnd()) };
 }
 
 export interface AggregatedResult {

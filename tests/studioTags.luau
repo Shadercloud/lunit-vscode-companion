@@ -88,7 +88,7 @@ else
 	local fn = luau.load(code, { environment = environment, injectGlobals = true })
 	local finished, ok, output = false, false, nil
 	task.spawn(function()
-		ok, output = pcall(fn, { protocol = 2 })
+		ok, output = pcall(fn, { protocol = 3 })
 		finished = true
 	end)
 	local deadline = os.clock() + 10

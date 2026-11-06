@@ -20,7 +20,24 @@ local panelOrder = {}
 local savedSettings = {}
 local scenario = process.args[2]
 -- abandon-hung-job: what the plugin saw and did with a job that never returns.
-local hung = {polls = 0, heartbeats = 0, posted = false, cleaned = false, pollsAfterAbandon = 0}
+local hung = {polls = 0, heartbeats = 0, posted = false, cleaned = false, pollsAfterAbandon = 0, bodies = {}}
+-- busy-job: a job that announces a test, then holds the thread synchronously
+-- (as a long test holds Studio's main thread), then yields and finishes.
+local BUSY_JOB = [[
+local owner = ...
+owner.cleanup = CLEANED
+owner.output = {"[lunit] before"}
+owner.phase = "tests"
+owner.currentTest = "Busy > blocks"
+owner.currentTestStarted = os.clock()
+owner.announce()
+local blockUntil = os.clock() + 0.4
+while os.clock() < blockUntil do end
+owner.currentTest = nil
+table.insert(owner.output, "[lunit] after")
+task.wait(1.3)
+return "done"
+]]
 if scenario == 'remembered-workspace' then
  savedSettings.LunitSelectedWorkspace = '/project34874'
  expectedPort = 34874
@@ -106,18 +123,23 @@ function http:RequestAsync(request)
  end
  assert(port == expectedPort, 'must not poll or post results to the unselected workspace')
  assert(request.Url:find('instanceId=id' .. tostring(expectedPort), 1, true), 'missing selected window identity')
- if scenario == 'abandon-hung-job' then
+ if scenario == 'abandon-hung-job' or scenario == 'busy-job' then
   assert(request.Url:find('session=', 1, true), 'every bridge request must name its plugin session')
-  if request.Method == 'POST' then hung.posted = true; return {Success = true} end
   if request.Url:find('/heartbeat', 1, true) then
    assert(request.Url:find('jobId=hung', 1, true), 'heartbeat must name its job')
+   assert(request.Method == 'POST', 'heartbeats carry progress in a POST body')
    hung.heartbeats += 1
-   -- VS Code keeps the job for one heartbeat, then the user presses Stop.
-   return {Success = true, Body = {active = hung.heartbeats < 2}}
+   table.insert(hung.bodies, request.Body)
+   -- abandon-hung-job: VS Code keeps the job for one heartbeat, then the user presses Stop.
+   return {Success = true, Body = {active = scenario == 'busy-job' or hung.heartbeats < 2}}
   end
+  if request.Method == 'POST' then hung.posted = request.Body.output; return {Success = true} end
   hung.polls += 1
-  if hung.polls == 1 then return {Success = true, Body = {jobId = 'hung', code = 'local owner = ...\nowner.cleanup = CLEANED\ncoroutine.yield()\nreturn "never"'}} end
-  if hung.cleaned then hung.pollsAfterAbandon += 1 end
+  if hung.polls == 1 then
+   return {Success = true, Body = {jobId = 'hung', code = scenario == 'busy-job' and BUSY_JOB
+    or 'local owner = ...\nowner.cleanup = CLEANED\ncoroutine.yield()\nreturn "never"'}}
+  end
+  if hung.cleaned or hung.posted then hung.pollsAfterAbandon += 1 end
   return {Success = true, Body = {}}
  end
  if port == 34873 then return {Success = true, Body = {}} end
@@ -135,7 +157,7 @@ local environment = {
  game = {GetService = function() return http end, PlaceId = 0, Name = 'Test Place'},
  plugin = plugin, task = task, print = function(message) table.insert(prints, message) end, warn = function(message) table.insert(warnings, message) end,
  loadstring = function(code)
-  return luau.load(code, {environment = {CLEANED = function() hung.cleaned = true end}, injectGlobals = true})
+  return luau.load(code, {environment = {CLEANED = function() hung.cleaned = true end, task = task}, injectGlobals = true})
  end,
 }
 luau.load(fs.readFile(process.args[1]), {environment = environment, injectGlobals = true})()
@@ -173,6 +195,29 @@ if scenario == 'debug-startup' then
  assert(#warnings == 1 and warnings[1]:find('No compatible workspaces', 1, true), 'debug must report an empty startup scan')
  unloading()
  print('Debug startup regression checks passed')
+ process.exit(0)
+end
+if scenario == 'busy-job' then
+ -- The announce goes out before the test blocks the thread, naming the test;
+ -- later heartbeats stream only new lines; a busy job is never abandoned.
+ local deadline = os.clock() + 8
+ while hung.pollsAfterAbandon == 0 and os.clock() < deadline do task.wait(0.05) end
+ local first = hung.bodies[1]
+ assert(first and first.test == 'Busy > blocks' and first.phase == 'tests', 'the test must be announced before it blocks')
+ assert(type(first.testSeconds) == 'number' and first.testSeconds < 0.3, 'announced as it starts')
+ assert(#first.lines == 1 and first.lines[1] == '[lunit] before', 'the first heartbeat streams the output so far')
+ local later = hung.bodies[#hung.bodies]
+ assert(#hung.bodies >= 2 and later.test == nil, 'heartbeats continue once the test is over')
+ local streamed = {}
+ for _, body in hung.bodies do for _, line in body.lines do table.insert(streamed, line) end end
+ assert(#streamed == 2 and streamed[2] == '[lunit] after', 'each line is streamed exactly once: ' .. table.concat(streamed, ' | '))
+ assert(hung.posted == 'done', 'the busy job must finish and post its result')
+ assert(not hung.cleaned or hung.posted, 'a busy job must not be abandoned')
+ for _, message in warnings do
+  assert(not message:find('stopped or released', 1, true), 'a busy job must not be abandoned: ' .. message)
+ end
+ unloading()
+ print('Busy job heartbeat regression checks passed')
  process.exit(0)
 end
 if scenario == 'abandon-hung-job' then

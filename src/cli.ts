@@ -39,11 +39,13 @@ import { parseTestFile } from './discovery';
 import { CancelReport, CliRunRequest, LiveSyncBridge } from './liveSyncBridge';
 import { buildTestSelection } from './luauTestFilterTemplate';
 import { LuneRunOutcome, RunOutcome, runViaLune } from './luneRunner';
-import { createResultLineFilter, parseResultLines } from './resultProtocol';
+import { LiveResults } from './liveResults';
+import { createResultLineFilter, parseResultLines, ResultRecord } from './resultProtocol';
 import { partitionSlowTests, slowTestFilterFor } from './runProfiles';
 import {
 	buildSummary,
 	formatSummary,
+	formatTestLines,
 	matchesFilters,
 	resolveBlockVerdict,
 	resolveVerdict,
@@ -55,8 +57,10 @@ import {
 	summaryFailed,
 	TestIdentity,
 	TestResultEntry,
+	Verdict,
 } from './runReport';
-import { runViaStudio } from './studioRunner';
+import { isRobloxStudioRunning } from './studioProcess';
+import { runViaStudio, StudioLiveHooks } from './studioRunner';
 
 interface CliArgs {
 	via: RunVia;
@@ -593,6 +597,7 @@ async function runStandalone(
 			onOutput(`[lunit] could not listen on the live-sync port ${port} (${err.message}); Studio live-sync unavailable for this run.\n`);
 			bridge = undefined;
 		});
+		ownedBridge.studioRunning = isRobloxStudioRunning;
 		bridge = ownedBridge;
 		bridge.start();
 		const deadline = Date.now() + 3500;
@@ -603,6 +608,23 @@ async function runStandalone(
 
 	const displayFilter = createResultLineFilter(onOutput);
 	const chunkSink = (chunk: string) => displayFilter.feed(chunk);
+	// Live-sync Studio runs stream each result: print its line as it comes
+	// (liveResults.ts); the summary then leaves those out.
+	const live = new LiveResults(leaves.map(identityOnly));
+	const liveHooks: StudioLiveHooks = {
+		event: (event) => {
+			for (const update of live.apply(event)) {
+				if (update.kind === 'verdict') {
+					onOutput(formatTestLines({ ...identityOnly(leaves[update.index]), ...update.verdict }, workspaceRoot).join('\n') + '\n');
+				}
+			}
+		},
+	};
+	const settle = (records: readonly ResultRecord[], fallback: (leaf: DiscoveredLeaf) => Verdict): TestResultEntry[] =>
+		leaves.map((leaf, index) => {
+			const reconciled = live.reconcile(index, records, fallback(leaf));
+			return { ...identityOnly(leaf), ...reconciled.verdict, streamed: !reconciled.report };
+		});
 	let outcome: LuneRunOutcome | RunOutcome;
 	try {
 		outcome =
@@ -620,12 +642,13 @@ async function runStandalone(
 						args.filters.length > 0 ? buildTestSelection(leaves) : undefined,
 						slowFilter,
 						args.filters.length > 0 ? leaves.map((leaf) => leaf.file) : undefined,
+						liveHooks,
 					);
 	} catch (err) {
 		displayFilter.flush();
 		const message = `[lunit] test run failed: ${String(err)}`;
 		onOutput(message + '\n');
-		return withSlowCount(buildSummary(args.via, leaves.map((leaf) => ({ ...identityOnly(leaf), status: 'errored', message })), false));
+		return withSlowCount(buildSummary(args.via, settle([], () => ({ status: 'errored', message })), false));
 	} finally {
 		ownedBridge?.stop();
 	}
@@ -657,10 +680,10 @@ async function runStandalone(
 		return report.blocks.length > 0 ? { ...summary, lune: summarizeReport(report) } : summary;
 	}
 	if (outcome.cancelled) {
-		return withSlowCount(buildSummary(args.via, leaves.map((leaf) => ({ ...identityOnly(leaf), status: 'skipped' })), true));
+		return withSlowCount(buildSummary(args.via, settle([], () => ({ status: 'skipped' })), true));
 	}
 	const records = parseResultLines(outcome.output);
-	const results: TestResultEntry[] = leaves.map((leaf) => ({ ...identityOnly(leaf), ...resolveVerdict(leaf, records, outcome) }));
+	const results: TestResultEntry[] = settle(records, (leaf) => resolveVerdict(leaf, records, outcome));
 	// A run that could not start at all (no place to build, say) is exit code
 	// 2, the same as any other reason the run could not be performed.
 	return withSlowCount(buildSummary(args.via, results, false, records.length === 0 ? outcome.error : undefined));

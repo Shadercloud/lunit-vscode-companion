@@ -94,6 +94,10 @@ export interface LunitConfig {
 		/** Whether the installed Studio plugin prints its status lines (discovery, connecting); baked in at install. */
 		debug: boolean;
 		timeoutSeconds: number;
+		/** Live-sync: how long one test may keep Studio from sending a heartbeat before the run is released. */
+		testTimeoutSeconds: number;
+		/** Live-sync: a test taking at least this long gets a warning line; 0 turns it off. */
+		slowTestWarningSeconds: number;
 		liveSync: {
 			enabled: boolean;
 			port: number;
@@ -198,6 +202,8 @@ export function buildConfig(root: string, storageDir: string, get: SettingReader
 			quitAfterExecution: get<boolean>('studio.quitAfterExecution', true),
 			debug: get<boolean>('studio.debug', false),
 			timeoutSeconds: get<number>('studio.timeoutSeconds', 180),
+			testTimeoutSeconds: get<number>('studio.testTimeoutSeconds', 120),
+			slowTestWarningSeconds: get<number>('studio.slowTestWarningSeconds', 5),
 			liveSync: {
 				enabled: get<boolean>('studio.liveSync.enabled', true),
 				port: get<number>('studio.liveSync.port', DEFAULT_LIVE_SYNC_PORT),

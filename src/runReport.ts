@@ -63,6 +63,9 @@ export function resolveVerdict(test: TestIdentity, records: readonly ResultRecor
 		}
 		return { status: 'skipped' };
 	}
+	if (outcome.unfinishedMessage) {
+		return { status: 'errored', message: outcome.unfinishedMessage };
+	}
 	if (outcome.timedOut) {
 		return { status: 'errored', message: TIMED_OUT_MESSAGE };
 	}
@@ -308,7 +311,13 @@ export function formatReportSummary(report: LuneRunReport): string[] {
 	return lines;
 }
 
-export interface TestResultEntry extends TestIdentity, Verdict {}
+export interface TestResultEntry extends TestIdentity, Verdict {
+	/**
+	 * Live-sync: this verdict was already reported while the run was going
+	 * (its line printed, its TestItem updated), so the summary does not repeat it.
+	 */
+	streamed?: boolean;
+}
 
 /**
  * The machine-readable record of one whole run, produced identically by both
@@ -356,9 +365,24 @@ function relativeFile(file: string, workspaceRoot: string): string {
 	return file;
 }
 
+/** The PASS/FAIL/SKIP/ERR line for one test, with its message lines; printed live and in summaries. */
+export function formatTestLines(test: TestIdentity & Verdict, workspaceRoot: string): string[] {
+	const icon: Record<VerdictStatus, string> = { passed: 'PASS', failed: 'FAIL', skipped: 'SKIP', errored: 'ERR ' };
+	const label = test.displayName ?? test.methodName;
+	const elapsed = test.elapsedMs !== undefined ? ` (${test.elapsedMs} ms)` : '';
+	const lines = [`${icon[test.status]}  ${relativeFile(test.file, workspaceRoot)} > ${test.className} > ${label}${elapsed}`];
+	if (test.message && test.status !== 'passed') {
+		for (const messageLine of test.message.split(/\r?\n/)) {
+			lines.push(`        ${messageLine}`);
+		}
+	}
+	return lines;
+}
+
 /**
  * Human-readable rendering of a summary, in the same order and with the same
- * messages a user would see in the Test Explorer / Test Results panel.
+ * messages a user would see in the Test Explorer / Test Results panel. Tests
+ * whose result was already printed live (`streamed`) are not repeated.
  */
 export function formatSummary(summary: RunSummary, workspaceRoot: string): string {
 	const lines: string[] = [];
@@ -368,19 +392,21 @@ export function formatSummary(summary: RunSummary, workspaceRoot: string): strin
 		return lines.join('\n');
 	}
 	if (summary.cancelled) {
-		lines.push(`[lunit] run via ${target} was cancelled.`);
+		// Results streamed before the cancel are real; say what they were.
+		const kept = summary.tests.filter((test) => test.streamed);
+		if (kept.length === 0) {
+			lines.push(`[lunit] run via ${target} was cancelled.`);
+			return lines.join('\n');
+		}
+		const count = (status: VerdictStatus) => kept.filter((test) => test.status === status).length;
+		lines.push(`[lunit] run via ${target} was cancelled after ${kept.length} test(s) reported: ${count('passed')} passed, ${count('failed')} failed, ${count('skipped')} skipped.`);
 		return lines.join('\n');
 	}
 
-	const icon: Record<VerdictStatus, string> = { passed: 'PASS', failed: 'FAIL', skipped: 'SKIP', errored: 'ERR ' };
 	for (const test of summary.tests) {
-		const label = test.displayName ?? test.methodName;
-		const elapsed = test.elapsedMs !== undefined ? ` (${test.elapsedMs} ms)` : '';
-		lines.push(`${icon[test.status]}  ${relativeFile(test.file, workspaceRoot)} > ${test.className} > ${label}${elapsed}`);
-		if (test.message && test.status !== 'passed') {
-			for (const messageLine of test.message.split(/\r?\n/)) {
-				lines.push(`        ${messageLine}`);
-			}
+		// Live-sync runs printed these as they finished.
+		if (!test.streamed) {
+			lines.push(...formatTestLines(test, workspaceRoot));
 		}
 	}
 

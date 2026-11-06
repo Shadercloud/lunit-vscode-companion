@@ -22,13 +22,13 @@ async function main() {
 		if (result.error) throw result.error;
 		if (result.status !== 0) return result.status ?? 1;
 		const hangLoad = path.join(dir, 'job-hang-load.luau');
-		fs.writeFileSync(hangLoad, buildLiveSyncJobScript({ loadTimeoutSeconds: 0.5 }));
+		fs.writeFileSync(hangLoad, buildLiveSyncJobScript({ loadTimeoutSeconds: 0.5, slowTestWarningSeconds: 0.2 }));
 		const hangClass = path.join(dir, 'job-hang-class.luau');
 		fs.writeFileSync(hangClass, buildLiveSyncJobScript({ deadlineSeconds: 1, selectedModules: ['hang.test', 'plain.test'] }));
 		const hang = spawnSync(process.env.LUNE_EXE || 'lune', ['run', 'tests/liveSyncHang.luau', hangLoad, hangClass], { stdio: 'inherit', timeout: 60000 });
 		if (hang.error) throw hang.error;
 		if (hang.status !== 0) return hang.status ?? 1;
-		for (const scenario of ['', 'cancel-startup', 'slow-unused-ports', 'remembered-workspace', 'remembered-unavailable', 'panel-layout-owned', 'quiet-startup', 'abandon-hung-job']) {
+		for (const scenario of ['', 'cancel-startup', 'slow-unused-ports', 'remembered-workspace', 'remembered-unavailable', 'panel-layout-owned', 'quiet-startup', 'abandon-hung-job', 'busy-job']) {
 			const selection = spawnSync(process.env.LUNE_EXE || 'lune', ['run', 'tests/pluginSelection.luau', plugin, scenario], { stdio: 'inherit' });
 			if (selection.error) throw selection.error;
 			if (selection.status !== 0) return selection.status ?? 1;

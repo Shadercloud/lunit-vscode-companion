@@ -63,16 +63,23 @@ end
 -- (reporter?.onTestEnd?.(...)) as a colon call, so the callback below
 -- receives the reporter table itself as an implicit first arg ahead of
 -- (label, result).
-local function lunitRunClass(lunit, cls, className)
+-- \`hooks\` (optional, the live-sync job only) gets onTestStart(label) before
+-- every test and @Each row and onTestEnd(label, result) after; both run inside
+-- Lunit's async runner, so they may yield.
+local function lunitRunClass(lunit, cls, className, hooks)
 	local labelOrder = {}
 	local lastByLabel = {}
 	local result = lunit.TestRunner:fromClasses({ cls }):run({
 		reporter = {
+			onTestStart = function(_self, label)
+				if hooks and hooks.onTestStart then hooks.onTestStart(label) end
+			end,
 			onTestEnd = function(_self, label, testResult)
 				if lastByLabel[label] == nil then
 					table.insert(labelOrder, label)
 				end
 				lastByLabel[label] = testResult
+				if hooks and hooks.onTestEnd then hooks.onTestEnd(label, testResult) end
 			end,
 		},
 	}):expect()

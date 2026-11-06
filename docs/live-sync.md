@@ -130,20 +130,62 @@ However the wait ends, the job is released at once:
   (`timeoutSeconds` plus 15 s for the job's own report).
 - **`lunit-cli --cancel`** (`POST /cancel`) or **Lunit: Cancel and Release the
   Roblox Studio Live-Sync Run**: these cancel CLI runs in flight and release the job.
-- **Studio gone.** While running a job the plugin sends a heartbeat about once a
-  second, carrying its session id (one per loaded plugin). A job with no heartbeat
-  for 15 s is released as "Roblox Studio stopped responding". A poll from a new
-  session (Studio restarted, or the plugin reloaded) releases a job held by a
-  session that has gone quiet at once.
+- **Studio gone, told apart from Studio busy.** While running a job the plugin
+  sends a heartbeat about once a second, carrying its session id (one per loaded
+  plugin), the job's phase (`loading`, `tests`), the test running and for how
+  long, and the job's new output lines. Before each test and `@Each` row the job
+  yields if it has held Studio past the 50 ms budget, then *announces* the test.
+  The plugin sends a heartbeat naming it straight away, so it is on its way
+  before a test that blocks Studio's main thread begins (announcements are at
+  most 10 a second, one request at a time). A synchronous test blocks the
+  plugin too, so a silent heartbeat means busy or gone. Once a heartbeat is 15 s
+  overdue the bridge asks the OS whether a Roblox Studio process is still running
+  (`tasklist`/`ps`, at most every 3 s):
+  - no Studio process: released at once ("Roblox Studio is no longer running"),
+    naming the last test it reported;
+  - in the `tests` phase, or a Studio process is still running: a busy test, so
+    the silence may last `lunit.studio.testTimeoutSeconds` (default 120). Past
+    that the run is released, naming the test and how long it had run;
+  - otherwise (setup, and the process list cannot be read): released at 15 s as
+    "Roblox Studio stopped responding".
+
+  A poll from a new session (Studio restarted, or the plugin reloaded) releases a
+  job held by a session that has gone quiet at once. With several Studio
+  windows open, closing the one running the tests leaves a Studio process
+  behind, so that case is caught at `testTimeoutSeconds` instead of at once.
+
+**Live results.** Every test start and every finished try go into the output
+the heartbeats carry, as `@@LUNIT_START@@` and `@@LUNIT_LIVE@@` lines (not
+printed in Studio, hidden from VS Code's output). The plugin sends them every
+250 ms or every 50 lines. `liveResults.ts` maps them to tests with the
+end-of-run rule (class plus display name, `@Each` rows "<name> (<args>)" folded
+into their test, the latest try of a retried test standing). The Test Explorer
+marks each test running when it starts and gives it its verdict as it finishes,
+and the CLI prints its `PASS`/`FAIL` line. The per-class `@@LUNIT_RESULT@@`
+lines stay the final word. At the end, a test whose final verdict matches what
+streamed is not reported again. One that differs gets the final verdict, with
+a note that it replaces the live one.
+
+**A released run keeps what came in.** Tests that streamed a result keep it,
+whether the run was cancelled, timed out or released. Only the tests that never
+reported get the fallback: skipped for Stop/Ctrl+C, otherwise errored with the
+reason (for example `run released after PlacePreviewOracleTests > renders ran
+120s+ without a heartbeat`).
+
+**Slow-test warning.** A test that takes `lunit.studio.slowTestWarningSeconds`
+(default 5; 0 turns it off) or longer gets a `WARNING: slow test <class> > <test>
+took N s` line in Studio's Output and the run output, so it can be tagged `Slow`
+or made to yield before it causes trouble.
 
 A released job's plugin learns at its next heartbeat (`active: false`), cancels
 the job thread, runs cleanup and posts nothing. It then polls again, so the next
-job never runs alongside the old one. If the selected VS Code window cannot be
-reached for 10 s during a job, the plugin abandons the job too. It retries a
-result VS Code could not take for 30 s, then goes back to polling. Plugin unload
-cancels the job thread before invoking cleanup.
+job never runs alongside the old one. If heartbeats to the selected VS Code window
+*fail* for 10 s during a job, the plugin abandons the job too. A heartbeat delayed
+by a blocking test is not a failure. It retries a result VS Code could not take
+for 30 s, then goes back to polling. Plugin unload cancels the job thread before
+invoking cleanup.
 
-The job needs this plugin protocol (`owner.protocol`); an older loaded plugin
+The job needs this plugin protocol (`owner.protocol` 3, from 0.10.0); an older loaded plugin
 gets an explicit "bridge is outdated" error. Tests tagged `@Tag("Lune")` are left
 out of the job entirely, so long Lune-only suites do not count against these
 timeouts.
@@ -199,6 +241,16 @@ The repository previously had a TypeScript compile script and no test suite.
   `tests/liveSyncBridge.test.cjs` covers Stop and timeout on a hung delivered
   job, `POST /cancel` with and without a CLI run waiting, a Studio restart (new
   session), lost heartbeats, and old session-less plugins.
+- Busy vs dead (added 2026-11-06, 0.10.0), in `tests/liveSyncBridge.test.cjs`
+  with time scaled down. A test that keeps Studio silent for 6x the heartbeat
+  timeout completes, with or without a process probe. A Studio that really
+  closed mid-run is released at the heartbeat timeout, and the results it had
+  streamed keep their verdicts while the unfinished test gets the reason. A test
+  past `testTimeoutSeconds` is released and named. The setup phase keeps the
+  15 s rule. `pluginSelection.luau busy-job` checks that the announce goes out
+  before a blocking job holds the thread, and that output lines are streamed
+  once each. `liveSyncHang.luau` checks that each test is announced and the slow
+  test warned about.
 
 Both commands passed on 2026-09-11. The harness uses a small simulated framework;
 it does not validate native Studio loadstring permissions, actual Lunit or React,
