@@ -13,6 +13,8 @@ export interface LiveSyncJobOptions {
 	loadTimeoutSeconds?: number;
 	/** A test that holds Studio at least this long gets a WARNING line; 0 turns the warning off. */
 	slowTestWarningSeconds?: number;
+	/** A test still running (yielded, not resumed) after this long fails on its own; the run goes on. */
+	testTimeoutSeconds?: number;
 	/**
 	 * ModuleScript names (file basenames without extension) holding the
 	 * selected tests. Other test modules are never loaded at all. Undefined
@@ -51,6 +53,7 @@ ${buildLuauTestFilterHelpers('Lune', options.selection, options.slow)}
 local DEADLINE_SECONDS = ${Math.floor(seconds(options.deadlineSeconds, 30, 0))}
 local LOAD_TIMEOUT_SECONDS = ${seconds(options.loadTimeoutSeconds, 10, 0.05)}
 local SLOW_TEST_WARNING_SECONDS = ${seconds(options.slowTestWarningSeconds, 5, 0)}
+local TEST_TIMEOUT_SECONDS = ${seconds(options.testTimeoutSeconds, 120, 0.05)}
 local SELECTED_MODULES = ${selected}
 local started = os.clock()
 local root = Instance.new("Folder")
@@ -82,6 +85,11 @@ local SKIPPED_REPORT_LIMIT = 5
 local globals, sharedGlobals = {}, {}
 local closed = false
 local threads = {}
+-- Which running test owns a thread: set for each test's own thread (see
+-- runGuardedTest) and inherited by every thread created from one through the
+-- task/coroutine shims. A test that times out takes its threads with it, and
+-- a bridge error in one of them fails that test.
+local threadGuard = setmetatable({}, { __mode = "k" })
 local function log(message)
 	local line = "[lunit] " .. message
 	print(line)
@@ -117,10 +125,12 @@ local function watchdog()
 	threads[coroutine.running()] = nil
 	watchdogThread = nil
 end
-local function bounded(timeout, fn, ...)
+-- With a guard (a running test), guard.fail(message) ends the wait at once:
+-- "failed" with that message.
+local function boundedWith(timeout, guard, fn, ...)
 	local args = table.pack(...)
 	local waiter = coroutine.running()
-	local state = { done = false, ok = false, value = nil, waiting = false, woken = false }
+	local state = { done = false, ok = false, value = nil, waiting = false, woken = false, failure = nil }
 	function state.wake()
 		if state.waiting and not state.woken then
 			state.woken = true
@@ -133,8 +143,17 @@ local function bounded(timeout, fn, ...)
 		state.wake()
 	end)
 	threads[thread] = true
+	if guard then
+		threadGuard[thread] = guard
+		guard.fail = function(message)
+			if state.done or state.failure ~= nil then return end
+			state.failure = message
+			pendingWaits[state] = nil
+			state.wake()
+		end
+	end
 	task.spawn(thread)
-	if not state.done then
+	if not state.done and state.failure == nil then
 		state.waiting = true
 		pendingWaits[state] = os.clock() + timeout
 		if watchdogThread == nil then
@@ -146,12 +165,17 @@ local function bounded(timeout, fn, ...)
 		pendingWaits[state] = nil
 	end
 	threads[thread] = nil
+	if guard then guard.fail = nil end
 	if not state.done then
 		local trace = debug.traceback(thread)
 		pcall(task.cancel, thread)
+		if state.failure ~= nil then return "failed", state.failure, trace end
 		return "timeout", trace
 	end
 	return state.ok and "ok" or "error", state.value
+end
+local function bounded(timeout, fn, ...)
+	return boundedWith(timeout, nil, fn, ...)
 end
 -- Names where a cancelled thread stalled: the snapshot module and line its
 -- traceback points at, and the child it waits for when that line calls
@@ -197,6 +221,7 @@ local function cleanup()
 		end
 	end
 	table.clear(threads)
+	table.clear(threadGuard)
 	root:Destroy()
 	owner.root = nil
 	table.clear(copies)
@@ -214,18 +239,59 @@ local function cleanup()
 	table.clear(sharedGlobals)
 end
 owner.cleanup = cleanup
+-- The task/coroutine shims only *track* threads (for cleanup, and for the
+-- test that owns them); scheduling is always the engine's own task/coroutine
+-- functions. Nothing here throws where the engine would not. The one gap
+-- filled in is Roblox refusing task.defer/task.delay of a thread that is not
+-- suspended when arguments are passed ("cannot defer non-suspended coroutine
+-- with arguments"): the resume is relayed until the thread has yielded, which
+-- is what code deferring its own thread (then yielding) relies on.
+local function adopt(thread)
+	threads[thread] = true
+	if threadGuard[thread] == nil then
+		threadGuard[thread] = threadGuard[coroutine.running()]
+	end
+	return thread
+end
+-- An error raised in a shim fails the test that owns the calling thread, with
+-- the error and its stack, instead of only reaching Output while that test
+-- waits for ever. The error is still raised, as the engine would.
+local function shim(name, body)
+	return function(...)
+		local result = table.pack(xpcall(body, function(err)
+			return { err = err, trace = debug.traceback(tostring(err), 2) }
+		end, ...))
+		if not result[1] then
+			local info = result[2]
+			local guard = threadGuard[coroutine.running()]
+			if guard and guard.fail then
+				guard.fail("error in " .. name .. " (bridge task shim): " .. tostring(info.trace))
+			end
+			error(info.err, 0)
+		end
+		return table.unpack(result, 2, result.n)
+	end
+end
+local function resumeOnceSuspended(target, args)
+	return function()
+		while coroutine.status(target) ~= "suspended" do
+			if coroutine.status(target) == "dead" then return end
+			task.wait()
+		end
+		task.spawn(target, table.unpack(args, 1, args.n))
+	end
+end
 local isolatedCoroutine = table.clone(coroutine)
 isolatedCoroutine.create = function(callback)
 	if closed then error("isolation: run has ended") end
-	local thread = coroutine.create(callback)
-	threads[thread] = true
-	return thread
+	return adopt(coroutine.create(callback))
 end
 isolatedCoroutine.wrap = function(callback)
 	local thread = isolatedCoroutine.create(callback)
 	return function(...)
 		local result = table.pack(coroutine.resume(thread, ...))
-		if not result[1] then error(result[2]) end
+		-- Propagate the error value as it was raised, as coroutine.wrap does.
+		if not result[1] then error(result[2], 0) end
 		return table.unpack(result, 2, result.n)
 	end
 end
@@ -260,24 +326,48 @@ local function snapshot(instance)
 end
 local isolatedRequire
 local base = getfenv()
+-- task.cancel, task.wait and the rest stay the engine's own (table.clone).
 local isolatedTask = table.clone(task)
-for _, name in { "spawn", "defer", "delay" } do
-	isolatedTask[name] = function(callback, ...)
-		if closed then error("isolation: run has ended") end
-		local thread
-		if name == "delay" then
-			local args = table.pack(...)
-			local target = args[1]
-			thread = type(target) == "thread" and target or coroutine.create(target)
-			threads[thread] = true
-			task.delay(callback, thread, table.unpack(args, 2, args.n))
+isolatedTask.spawn = shim("task.spawn", function(callback, ...)
+	if closed then error("isolation: run has ended") end
+	local thread = adopt(type(callback) == "thread" and callback or coroutine.create(callback))
+	task.spawn(thread, ...)
+	return thread
+end)
+isolatedTask.defer = shim("task.defer", function(callback, ...)
+	if closed then error("isolation: run has ended") end
+	if type(callback) == "thread" then
+		adopt(callback)
+		if select("#", ...) > 0 and coroutine.status(callback) ~= "suspended" then
+			task.defer(adopt(coroutine.create(resumeOnceSuspended(callback, table.pack(...)))))
 		else
-			thread = type(callback) == "thread" and callback or coroutine.create(callback)
-			threads[thread] = true
-			task[name](thread, ...)
+			task.defer(callback, ...)
 		end
-		return thread
+		return callback
 	end
+	local thread = adopt(coroutine.create(callback))
+	task.defer(thread, ...)
+	return thread
+end)
+isolatedTask.delay = shim("task.delay", function(seconds, callback, ...)
+	if closed then error("isolation: run has ended") end
+	if type(callback) == "thread" then
+		adopt(callback)
+		if select("#", ...) > 0 and coroutine.status(callback) ~= "suspended" then
+			task.delay(seconds, adopt(coroutine.create(resumeOnceSuspended(callback, table.pack(...)))))
+		else
+			task.delay(seconds, callback, ...)
+		end
+		return callback
+	end
+	local thread = adopt(coroutine.create(callback))
+	task.delay(seconds, thread, ...)
+	return thread
+end)
+-- Legacy globals: spawn(fn) runs fn later, not at once (like task.defer);
+-- delay(t, fn) is task.delay.
+local function legacySpawn(callback)
+	return isolatedTask.defer(callback)
 end
 -- Match Roblox require-by-string paths, resolving only inside the snapshot.
 local function resolvePath(context, path)
@@ -340,7 +430,7 @@ isolatedRequire = function(target)
 				return isolatedRequire(type(target) == "string" and resolvePath(module, target) or target)
 			end, _G = globals, shared = sharedGlobals,
 			task = isolatedTask, coroutine = isolatedCoroutine,
-			spawn = isolatedTask.spawn, delay = isolatedTask.delay,
+			spawn = legacySpawn, delay = isolatedTask.delay,
 		}, { __index = base })
 		setfenv(fn, env)
 		local result = table.pack(fn())
@@ -368,6 +458,63 @@ end
 -- the final word.
 local LIVE_START_MARKER = "${LIVE_START_MARKER}"
 local LIVE_RESULT_MARKER = "${LIVE_RESULT_MARKER}"
+-- Per-test guard. Each test method runs on its own thread under
+-- TEST_TIMEOUT_SECONDS, so a test that yields and is never resumed (or
+-- awaits a promise that never settles) fails on its own: its threads are
+-- cancelled and the failure is raised on Lunit's thread, where Lunit records
+-- it, runs afterEach and moves on to the next test. A bridge error in one of
+-- the test's threads (see shim) fails it the same way, at once.
+local function isPromise(value)
+	return type(value) == "table" and type(value.await) == "function" and type(value.andThen) == "function"
+end
+local function yieldedAt(trace)
+	local frames = {}
+	for line in string.gmatch(tostring(trace or ""), "[^\\n]+") do
+		local chunk, lineNumber = line:match('%[string "(LunitRun%.[^"]+)"%]:(%d+)')
+		if not chunk then chunk, lineNumber = line:match("(LunitRun%.[^:%s]+):(%d+)") end
+		if chunk and #frames < 3 then table.insert(frames, chunk:sub(10) .. ":" .. lineNumber) end
+	end
+	if #frames == 0 then return describeStall(trace) end
+	return table.concat(frames, " <- ")
+end
+local function runGuardedTest(original, instance, ...)
+	local guard = {}
+	local status, value = boundedWith(TEST_TIMEOUT_SECONDS, guard, function(...)
+		local result = original(instance, ...)
+		if isPromise(result) then
+			local settled, reason = result:await()
+			if not settled then error(reason, 0) end
+		end
+	end, ...)
+	if status == "ok" then return end
+	if status ~= "error" then
+		for thread, owner in threadGuard do
+			if owner == guard and thread ~= coroutine.running() and coroutine.status(thread) ~= "dead" then
+				pcall(task.cancel, thread)
+			end
+		end
+	end
+	if status == "timeout" then
+		error(string.format("timed out after %s s (lunit.studio.testTimeoutSeconds): still yielded at %s",
+			tostring(TEST_TIMEOUT_SECONDS), yieldedAt(value)), 0)
+	end
+	-- "failed" (a bridge error, with its stack) or the test's own error, as raised.
+	error(value, 0)
+end
+local function guardTests(cls)
+	local methods = cls["lunit:method:test"]
+	if type(methods) ~= "table" then return end
+	for key, method in methods do
+		local name = type(method) == "table" and (method.name or key) or nil
+		local original = name and rawget(cls, name) or (name and cls[name])
+		if type(method) == "table" and type(method.options) == "table" and method.options.isTest
+			and type(original) == "function" then
+			cls[name] = function(instance, ...)
+				return runGuardedTest(original, instance, ...)
+			end
+		end
+	end
+end
 local function testHooks(className)
 	local testStarted = os.clock()
 	return {
@@ -609,6 +756,7 @@ local ok, failure = xpcall(function()
 			if run then
 				local executionStart = os.clock()
 				local remaining = DEADLINE_SECONDS - (os.clock() - started)
+				guardTests(cls)
 				local status, err = bounded(math.max(remaining, 0), lunitRunClass, lunit, cls, className, testHooks(className))
 				owner.currentTest = nil
 				executionSeconds += os.clock() - executionStart

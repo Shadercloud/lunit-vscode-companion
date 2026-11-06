@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.10.1
+
+### Fixed
+
+- **`task.defer`/`task.delay` of the running thread works in live-sync runs.** Code that defers its own thread
+  with a value and then yields (`task.defer(coroutine.running(), result)` from a callback that may answer
+  before the thread has yielded) failed with "cannot defer non-suspended coroutine with arguments". The test
+  then waited for ever and held the run until the live-sync timeout. The bridge's task shims now only track
+  threads and call the engine's own `task.*`. Where the engine refuses to defer or delay a non-suspended
+  thread with arguments, the shim queues the resume until the thread has yielded. Legacy `spawn(fn)` now
+  runs `fn` later, as in Roblox, rather than at once, and a `coroutine.wrap` error is passed on as raised.
+- **A test that yields and is never resumed fails on its own.** Each test now runs under
+  **`lunit.studio.testTimeoutSeconds`** (default 120) in live-sync runs too, not just for the heartbeat. A test
+  still waiting after that fails with `timed out after N s (lunit.studio.testTimeoutSeconds): still yielded
+  at <module>:<line>`. Its threads are cancelled, its `afterEach` runs, and the run goes on with the next
+  test, instead of one stuck test using up the whole run's live-sync timeout.
+- **A bridge error fails the test it happened for.** An error raised inside the bridge's task shims, in a
+  thread a test started, now fails that test at once with the error and its stack, and the run continues.
+  Before, it only reached Studio's Output while the test waited.
+
 ## 0.10.0
 
 A long, legitimate test no longer fails a whole Studio run as "Roblox Studio stopped responding". **Reinstall

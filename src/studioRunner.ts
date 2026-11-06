@@ -422,6 +422,7 @@ async function runViaLiveSync(
 				deadlineSeconds: config.studio.liveSync.timeoutSeconds,
 				loadTimeoutSeconds: config.studio.liveSync.loadTimeoutSeconds,
 				slowTestWarningSeconds: config.studio.slowTestWarningSeconds,
+				testTimeoutSeconds: config.studio.testTimeoutSeconds,
 				selectedModules: selectedModules ? [...selectedModules] : undefined,
 			}),
 			(config.studio.liveSync.timeoutSeconds + LIVE_SYNC_REPORT_GRACE_SECONDS) * 1000,

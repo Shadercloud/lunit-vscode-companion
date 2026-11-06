@@ -83,6 +83,17 @@ No consumer RuntimeLib or test files are rewritten.
   enumerate/disconnect arbitrary service callbacks. The job reports this boundary
   in its output. Scheduled tasks and coroutines created through the supplied
   task/coroutine APIs are tracked and cancelled at cleanup.
+- The supplied `task.spawn`/`task.defer`/`task.delay` and `coroutine.create`/
+  `coroutine.wrap` only *track* threads, for cleanup and for the test that owns
+  them, and then call the engine's own functions; `task.cancel`, `task.wait` and the
+  rest of `task`/`coroutine` are the engine's, untouched. The one gap filled in:
+  Roblox refuses to defer or delay a thread that is not suspended when arguments
+  are passed ("cannot defer non-suspended coroutine with arguments"). There the
+  shim queues the resume and hands it over once the thread has yielded, which is
+  what deferring your own thread and then yielding relies on. Legacy `spawn(fn)`
+  runs `fn` later (as `task.defer`), and `delay` is `task.delay`. An error raised
+  inside a shim fails the test whose thread raised it, with the error and its
+  stack, and is still raised as the engine would.
 
 ## Ownership, cancellation and timeout
 
@@ -102,6 +113,15 @@ something is waiting:
   once rather than waiting out the timeout again. The rest of the run continues.
 - RuntimeLib and `@rbxts/lunit` load under the same timeout; a timeout there
   fails the run with the same message.
+- Each test method gets `lunit.studio.testTimeoutSeconds` (default 120). The job
+  wraps every test method of a class before it runs, so the method's body runs
+  on its own thread. A test still yielded after that, never resumed or awaiting a
+  promise that never settles, fails with `timed out after N s
+  (lunit.studio.testTimeoutSeconds): still yielded at <module>:<line>`. Its threads
+  are cancelled and the failure is raised on Lunit's thread, so Lunit records it,
+  runs `afterEach` and goes on with the next test. A synchronous test that blocks
+  Studio is the heartbeat's business instead (see "Studio gone, told apart from
+  Studio busy" below), with the same limit.
 - `lunit.studio.liveSync.timeoutSeconds` is the whole-run watchdog. No test module
   starts after it (`ERROR: stopped after …`), and a test class still running at
   that point is cancelled (`ERROR: test class … was still running at the … s
