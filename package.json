@@ -2,7 +2,7 @@
   "name": "vscode-lunit-companion",
   "displayName": "Lunit Test Companion",
   "description": "Discover and run @rbxts/lunit tests from VS Code's Test Explorer.",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "publisher": "ShaderCloud",
   "author": "ShaderCloud",
   "license": "MIT",
@@ -52,6 +52,10 @@
       {
         "command": "lunit.showLiveSyncStatus",
         "title": "Lunit: Show Roblox Studio Live-Sync Status"
+      },
+      {
+        "command": "lunit.resetLiveSync",
+        "title": "Lunit: Cancel and Release the Roblox Studio Live-Sync Run"
       },
       {
         "command": "lunit.installAgentInstructions",
@@ -234,7 +238,13 @@
         "lunit.studio.liveSync.timeoutSeconds": {
           "type": "number",
           "default": 30,
-          "description": "How long to wait for the connected Studio plugin to run the tests and report back before giving up."
+          "description": "Whole-run limit for a live-sync run in Studio. The job stops starting test modules, and cancels a test class still running, once this has passed; VS Code waits a little longer than this for its report."
+        },
+        "lunit.studio.liveSync.loadTimeoutSeconds": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "description": "How long one test module (with its imports) may take to load in a live-sync run. A module still loading after this -- typically waiting on a child that is not in the snapshot -- is abandoned and its tests reported as errored, and the rest of the run continues."
         },
         "lunit.studio.liveSync.syncDelaySeconds": {
           "type": "number",
@@ -262,6 +272,9 @@
         },
         {
           "command": "lunit.showLiveSyncStatus"
+        },
+        {
+          "command": "lunit.resetLiveSync"
         },
         {
           "command": "lunit.installAgentInstructions"

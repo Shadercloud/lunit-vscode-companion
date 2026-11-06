@@ -11,8 +11,11 @@
  * exactly what makes running tests without ever pressing Play possible.
  *
  * Protocol (127.0.0.1-only, see liveSyncBridge.ts):
- *   GET  {baseUrl}/poll   -> { jobId: string, code: string } | { jobId: null }
- *   POST {baseUrl}/result <- { jobId: string, output: string }
+ *   GET  {baseUrl}/poll?session=      -> { jobId: string, code: string } | { jobId: null }
+ *   GET  {baseUrl}/heartbeat?jobId=   -> { active: boolean }  (about once a second while a job runs;
+ *                                        false: VS Code released the job, so cancel it and clean up)
+ *   POST {baseUrl}/result             <- { jobId: string, output: string }
+ * Every request carries the selected window's instanceId and this plugin's session id.
  *
  * `code` is `loadstring`'d and called directly; its return value (a plain
  * string -- see liveSyncScriptTemplate.ts) becomes `output`. Trust model:
@@ -59,16 +62,73 @@ ${buildStudioPickerScript()}
 
 debugPrint("[lunit] Connecting automatically. Click Lunit to manage the bridge connection.")
 
-local function runJob(code: string): string
+-- One id per loaded plugin. VS Code uses it to tell a restarted Studio (or a
+-- reloaded plugin) from the session that took a job, and releases that job.
+local guidOk, guid = pcall(function() return HttpService:GenerateGUID(false) end)
+local SESSION_ID = guidOk and tostring(guid) or tostring(os.clock())
+local HEARTBEAT_SECONDS = 1
+-- A job whose VS Code window has been unreachable this long is abandoned.
+local UNREACHABLE_ABANDON_SECONDS = 10
+-- How long to keep retrying a result VS Code could not take, before polling again.
+local RESULT_RETRY_SECONDS = 30
+local activeJobThread = nil
+
+-- Asks the selected window whether it still wants this job. "no" means the
+-- run was stopped, timed out or released there (or the window reloaded).
+local function jobStillWanted(target, query: string, jobId: string): boolean?
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = target.baseUrl .. "/heartbeat" .. query .. "&jobId=" .. HttpService:UrlEncode(jobId),
+			Method = "GET",
+		})
+	end)
+	if not ok then return nil end
+	if response.StatusCode == 409 then return false end
+	if not response.Success then return nil end
+	local decodeOk, body = pcall(function() return HttpService:JSONDecode(response.Body) end)
+	if not decodeOk or type(body) ~= "table" then return nil end
+	return body.active == true
+end
+
+-- Runs the job on its own thread so this one can keep heartbeating. When VS
+-- Code no longer wants the job, it is cancelled and cleaned up here, so a job
+-- that never returns can never wedge the bridge. Returns nil when abandoned.
+local function runJob(code: string, target, query: string, jobId: string): string?
 	local fn, compileErr = loadstring(code)
 	if not fn then
 		return "[lunit] ERROR: failed to compile job: " .. tostring(compileErr)
 	end
-	local owner = {}
+	local owner = { protocol = 2 }
 	activeOwner = owner
-	local ok, result = pcall(fn, owner)
+	local finished, ok, result = false, false, nil
+	local jobThread = coroutine.create(function()
+		ok, result = pcall(fn, owner)
+		finished = true
+	end)
+	activeJobThread = jobThread
+	task.spawn(jobThread)
+	local abandoned = false
+	local lastHeartbeat, lastReached = os.clock(), os.clock()
+	while not finished and alive do
+		task.wait(0.1)
+		if not finished and os.clock() - lastHeartbeat >= HEARTBEAT_SECONDS then
+			lastHeartbeat = os.clock()
+			local wanted = jobStillWanted(target, query, jobId)
+			if wanted ~= nil then lastReached = os.clock() end
+			if wanted == false or (wanted == nil and os.clock() - lastReached >= UNREACHABLE_ABANDON_SECONDS) then
+				abandoned = true
+				break
+			end
+		end
+	end
+	if not finished then
+		pcall(task.cancel, jobThread)
+		if abandoned then warn("[lunit] VS Code stopped or released the running test job; it was cancelled and cleaned up.") end
+	end
+	activeJobThread = nil
 	if owner.cleanup then pcall(owner.cleanup) end
 	activeOwner = nil
+	if not finished then return nil end
 	if not ok then
 		return "[lunit] ERROR: job errored: " .. tostring(result)
 	end
@@ -78,7 +138,7 @@ end
 local function poll()
 	local target = selected
 	if not target then return end
-	local query = "?instanceId=" .. HttpService:UrlEncode(target.instanceId)
+	local query = "?instanceId=" .. HttpService:UrlEncode(target.instanceId) .. "&session=" .. HttpService:UrlEncode(SESSION_ID)
 	local requestOk, response = pcall(function()
 		return HttpService:RequestAsync({
 			Url = target.baseUrl .. "/poll" .. query,
@@ -109,11 +169,14 @@ local function poll()
 		return
 	end
 
-	local output = runJob(body.code)
+	local output = runJob(body.code, target, query, body.jobId)
+	if output == nil then return end
 
-	-- A result acknowledges cleanup. Retry delivery before accepting another
-	-- job, so a transient HTTP failure cannot strand the extension's run lock.
-	while alive do
+	-- Retry a transient HTTP failure for a while, but never for ever: VS Code
+	-- releases the run on its own side (timeout, Stop, heartbeat loss), so a
+	-- result nobody takes must not stop this bridge from polling again.
+	local retryUntil = os.clock() + RESULT_RETRY_SECONDS
+	while alive and os.clock() < retryUntil do
 		local sent, response = pcall(function()
 			return HttpService:RequestAsync({
 				Url = target.baseUrl .. "/result" .. query,
@@ -132,6 +195,7 @@ plugin.Unloading:Connect(function()
 	cancelDiscovery()
 	destroyPanels()
 	if activeThread then pcall(task.cancel, activeThread) end
+	if activeJobThread then pcall(task.cancel, activeJobThread) end
 	if activeOwner and activeOwner.cleanup then pcall(activeOwner.cleanup) end
 	activeOwner = nil
 end)

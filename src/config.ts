@@ -98,6 +98,8 @@ export interface LunitConfig {
 			enabled: boolean;
 			port: number;
 			timeoutSeconds: number;
+			/** Per test module: how long one module's load may take before it is abandoned and reported as errored. */
+			loadTimeoutSeconds: number;
 			syncDelaySeconds: number;
 		};
 	};
@@ -200,6 +202,7 @@ export function buildConfig(root: string, storageDir: string, get: SettingReader
 				enabled: get<boolean>('studio.liveSync.enabled', true),
 				port: get<number>('studio.liveSync.port', DEFAULT_LIVE_SYNC_PORT),
 				timeoutSeconds: get<number>('studio.liveSync.timeoutSeconds', 30),
+				loadTimeoutSeconds: get<number>('studio.liveSync.loadTimeoutSeconds', 10),
 				syncDelaySeconds: get<number>('studio.liveSync.syncDelaySeconds', 1),
 			},
 		},

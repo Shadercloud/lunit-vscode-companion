@@ -3,7 +3,10 @@
 Each job takes one detached snapshot of the place's ModuleScripts and their
 container ancestry, then maps original test candidates into it. Nothing is
 parented to the DataModel, and no Script or LocalScript is copied or activated --
-one standing in a module's ancestry becomes a plain same-named Folder. Discovery
+one standing in a module's ancestry becomes a plain same-named Folder. A clone's
+`Source` property is left empty: the loader keeps each module's source in its own
+table, so a module of any size (Studio refuses to assign a `Source` of more than
+about 200,000 characters) is snapshotted like any other. Discovery
 still scans original place descendants for `.test`/`.spec`, excluding immediate
 children of `forks`. Plugin and PluginDebugService descendants are excluded. This preserves existing discovery scope, including nested
 packages; it does not establish which VS Code workspace owns the open place.
@@ -45,18 +48,32 @@ No consumer RuntimeLib or test files are rewritten.
   class) is left out of the snapshot rather than failing the run: the scan covers
   every module in the place, so an unrelated tree must not be able to abort a run
   that never needed it. Those modules are reported once as a capped warning
-  (`N module(s) skipped (unsupported ancestor): ...`). Being skipped is only ever
+  (`N module(s) skipped: <path> (<the actual error> [<n> characters of source]); ...`).
+  A stub ModuleScript with the same name stands in the module's place in the
+  snapshot (with Folder stand-ins for the unsupported ancestry), so
+  `WaitForChild` and `TS.import` find it and requiring it fails with that reason
+  instead of waiting for ever. Being skipped is only ever
   a warning while nothing needs the module -- a test that sits under such an
   ancestor is reported as that test failing to load, an import of a skipped module
   fails with the explicit diagnostic and the dependency chain that reached it, and
   a skipped RuntimeLib or `@rbxts/lunit` still fails the whole run. Skipping never
   turns into a silently missing test.
 - The snapshot contains module source, names, attributes and Folder structure;
-  it is not a cloned world. Tests reading assets through `script` ancestry,
-  relying on service class identity in that ancestry, or expecting the cloned
-  script to be a descendant of the real game are outside this supported layout.
-  Real service paths remain available. Missing asset children can cause a wait;
-  the timeout/draining limitation below applies.
+  it is not a cloned world. Every other child of a snapshotted container -- a
+  LocalScript or Script (smartbone's `Dependencies.Runtime`, say), an Actor, a
+  value object, a RemoteEvent, a Model -- gets an empty placeholder of the same
+  class and name (a Folder when the class cannot be created), so code that waits
+  for it by name gets an answer. Placeholder scripts are disabled and have no
+  source; a value object keeps its `Value`; nothing below a placeholder is copied.
+  Tests reading assets through `script` ancestry, relying on service class
+  identity in that ancestry, or expecting the cloned script to be a descendant of
+  the real game are outside this supported layout. Real service paths remain
+  available.
+- `TS.import(context, parent, "a", "b")` resolves its path parts inside the
+  snapshot before RuntimeLib sees them. Nothing is ever added to the snapshot, so
+  a missing part fails at once (`<path> has no child "a" in the snapshot`) rather
+  than through RuntimeLib's `WaitForChild`. Any other wait that cannot end is
+  caught by the load timeout below.
 - This is an import environment, not a sandbox. Modules must use the supplied
   require/global environment. Code deliberately retrieving another environment,
   external cached callbacks/exports, dynamically created modules, and native
@@ -69,37 +86,67 @@ No consumer RuntimeLib or test files are rewritten.
 
 ## Ownership, cancellation and timeout
 
-The bridge delivers a job only once. Until its result acknowledges completion,
-other runs are refused and a busy Studio continues to count as connected, avoiding
-a fallback launch just because the plugin is busy rather than polling.
+A live-sync run can never hang for ever, and recovering from one that goes wrong
+never needs a restart of Studio or a reload of VS Code.
 
-Cancellation or timeout before delivery drops the job. After delivery, it ends
-the VS Code wait but **does not interrupt the Studio tests**: the acknowledgement
-lock remains until execution finishes and cleanup runs. This drain policy avoids
-racing module destruction against executing tests. The plugin retries result
-submission after transient HTTP errors. The job uses protected cleanup on load
-and execution failures; plugin unload cancels the job thread before invoking
-cleanup. On normal completion (including caught load/test errors), the job first
-yields once through the host scheduler so Promise resolvers that synchronously
-resumed an awaiter can finish their finally callbacks before the environment is
-closed. Cleanup timing includes this scheduler turn. Cleanup cancels owned tasks,
-destroys the detached tree, and clears
-loader maps, caches and globals.
+**Inside the job.** Every module load and every test class runs on its own thread
+under a deadline, enforced by one watchdog thread that is alive only while
+something is waiting:
 
-A permanently hung test, lost Studio process, plugin unload before acknowledgement,
-or lost response to the initial poll can leave the bridge locked. There is no
-forced-reset action: resetting while execution might still be active would violate
-the isolation guarantee. Resolve the hung work before reloading the extension.
-Do not use non-yielding infinite loops to test cancellation. This change provides
-safe draining, not preemptive cancellation of arbitrary Roblox work.
+- Each test module, with everything it imports, gets
+  `lunit.studio.liveSync.loadTimeoutSeconds` (default 10). A load still running
+  then is cancelled and that test module is reported as failing to load:
+  `timed out after 10 s loading <module> (waiting on child "X" at <module>:<line>)`,
+  naming the child when the stalled line calls `WaitForChild`. Every module that
+  load had in flight is cached as failed, so another test importing one fails at
+  once rather than waiting out the timeout again. The rest of the run continues.
+- RuntimeLib and `@rbxts/lunit` load under the same timeout; a timeout there
+  fails the run with the same message.
+- `lunit.studio.liveSync.timeoutSeconds` is the whole-run watchdog. No test module
+  starts after it (`ERROR: stopped after …`), and a test class still running at
+  that point is cancelled (`ERROR: test class … was still running at the … s
+  live-sync timeout and was cancelled`). Results already reported are kept.
+- A selected run (a Test Explorer selection or CLI filters) loads only the test
+  modules that hold the selected tests, so a module elsewhere that cannot load
+  cannot affect it. If no module name matches, every test module is loaded.
 
-What the job can do is bound itself between test classes. It checks the elapsed
-time before starting each class. Once `lunit.studio.liveSync.timeoutSeconds` has
-passed (VS Code has stopped waiting by then), it logs an `ERROR: stopped after …`
-line and drains as above. It also yields a frame between classes at least every
-50 ms. A single class that runs too long still holds Studio until that class
-finishes. Tests tagged `@Tag("Lune")` are left out of the job entirely, so
-long Lune-only suites no longer count against this timeout.
+The job is woken through the host `task.defer`, never inside a worker's or a
+Promise resolver's stack. On normal completion (including caught load/test
+errors) it still yields once through the host scheduler before cleanup, so
+Promise resolvers that synchronously resumed an awaiter can finish their finally
+callbacks before the environment is closed. Cleanup cancels owned tasks (load and
+class threads included), destroys the detached tree, and clears loader maps,
+caches and globals. A cancelled thread stops where it was; it is not unwound, so
+a test interrupted mid-way does not run its own teardown. Real-service side
+effects it made remain, as with any test that errors. Non-yielding infinite loops
+cannot be interrupted by anything in Luau and are outside this guarantee.
+
+**Between VS Code and Studio.** The bridge delivers a job once. While VS Code
+waits for it, other runs are refused with a message naming the ways out, and a
+busy Studio still counts as connected. The run lock never outlives that wait.
+However the wait ends, the job is released at once:
+
+- **Stop** in the Testing view, Ctrl+C on the CLI, or the timeout
+  (`timeoutSeconds` plus 15 s for the job's own report).
+- **`lunit-cli --cancel`** (`POST /cancel`) or **Lunit: Cancel and Release the
+  Roblox Studio Live-Sync Run**: these cancel CLI runs in flight and release the job.
+- **Studio gone.** While running a job the plugin sends a heartbeat about once a
+  second, carrying its session id (one per loaded plugin). A job with no heartbeat
+  for 15 s is released as "Roblox Studio stopped responding". A poll from a new
+  session (Studio restarted, or the plugin reloaded) releases a job held by a
+  session that has gone quiet at once.
+
+A released job's plugin learns at its next heartbeat (`active: false`), cancels
+the job thread, runs cleanup and posts nothing. It then polls again, so the next
+job never runs alongside the old one. If the selected VS Code window cannot be
+reached for 10 s during a job, the plugin abandons the job too. It retries a
+result VS Code could not take for 30 s, then goes back to polling. Plugin unload
+cancels the job thread before invoking cleanup.
+
+The job needs this plugin protocol (`owner.protocol`); an older loaded plugin
+gets an explicit "bridge is outdated" error. Tests tagged `@Tag("Lune")` are left
+out of the job entirely, so long Lune-only suites do not count against these
+timeouts.
 
 Compile and the existing `syncDelaySeconds` delay are unchanged. Fresh snapshots
 contain the source present in Studio at snapshot time; they do not prove Rojo has
@@ -139,6 +186,19 @@ The repository previously had a TypeScript compile script and no test suite.
   `tests/fixtures/game` in a real `@lune/roblox` DataModel. It checks that
   class-level and method-level `@Tag("Lune")` tests are left out, for a whole-tree
   run and for an explicit selection, and that the job stops at its deadline.
+
+- Hang recovery (added 2026-11-06). `tests/liveSyncHang.luau` gives Lune's
+  Instance a `WaitForChild` that waits for ever, as Studio's does. It covers a
+  300 KB module, a package module waiting on a LocalScript and a StringValue
+  sibling, a module waiting on a child that never exists (two importers, one
+  timeout), a `TS.import` of a missing path, a skipped module reached through
+  `TS.import`, and a test class that never finishes under a selected run. Each
+  scenario ends with errors reported, the other tests run, and a clean next run.
+  `tests/pluginSelection.luau abandon-hung-job` checks that the plugin cancels,
+  cleans up and keeps polling when VS Code drops a job that never returns.
+  `tests/liveSyncBridge.test.cjs` covers Stop and timeout on a hung delivered
+  job, `POST /cancel` with and without a CLI run waiting, a Studio restart (new
+  session), lost heartbeats, and old session-less plugins.
 
 Both commands passed on 2026-09-11. The harness uses a small simulated framework;
 it does not validate native Studio loadstring permissions, actual Lunit or React,

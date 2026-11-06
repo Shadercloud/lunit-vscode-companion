@@ -12,35 +12,136 @@ async function fixture(t) {
  await new Promise(resolve => bridge.server.on('listening', resolve));
  const url = `http://127.0.0.1:${bridge.server.address().port}`;
  t.after(() => { bridge.server.closeAllConnections(); bridge.stop(); });
+ const session = s => (s ? `?session=${s}` : '');
  return {
   bridge,
-  poll: async () => (await fetch(url + '/poll')).json(),
+  url,
+  poll: async s => (await fetch(url + '/poll' + session(s))).json(),
+  heartbeat: async (job, s) => (await fetch(`${url}/heartbeat?jobId=${job.jobId}${s ? `&session=${s}` : ''}`)).json(),
+  cancelAll: async () => (await fetch(url + '/cancel', {method: 'POST'})).json(),
   result: async (job, output = 'done') => fetch(url + '/result', {
    method: 'POST', body: JSON.stringify({jobId: job.jobId, output}),
   }),
  };
 }
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// A Studio job that never returns (a hung require) must never hold the lock:
+// however the wait ends, the next run starts at once, and the plugin is told
+// to abandon the old job.
 for (const mode of ['cancel', 'timeout']) {
- test(`${mode}: delivered job drains before subsequent run`, async t => {
-  const {bridge, poll, result} = await fixture(t);
+ test(`${mode}: a hung delivered job releases the lock at once`, async t => {
+  const {bridge, poll, heartbeat, result} = await fixture(t);
   const cancel = new CancelSource();
   const promise = bridge.runJob('code', mode === 'timeout' ? 100 : 5000, cancel.token);
-  const rejected = assert.rejects(promise, mode === 'timeout' ? /timed out/ : /cancelled/);
-  const job = await poll();
+  const rejected = assert.rejects(promise, mode === 'timeout' ? /timed out.*released/ : /cancelled/);
+  const job = await poll('studio');
   assert.equal(job.code, 'code');
-  assert.equal((await poll()).jobId, null);
+  assert.equal((await poll('studio')).jobId, null);
+  assert.deepEqual(await heartbeat(job, 'studio'), {active: true});
   if (mode === 'cancel') cancel.cancel();
   await rejected;
-  assert.equal(bridge.isPluginConnected, true);
-  await assert.rejects(bridge.runJob('next', 5000), /cleanup acknowledgement/);
-  await result({jobId: 'unrelated'});
-  await assert.rejects(bridge.runJob('next', 5000), /cleanup acknowledgement/);
-  await result(job);
+  assert.equal(bridge.hasActiveJob, false);
+  assert.deepEqual(await heartbeat(job, 'studio'), {active: false}, 'the plugin must learn to abandon the job');
   const next = bridge.runJob('next', 5000);
-  await result(await poll());
+  // A late result for the abandoned job is ignored, not taken as the next one's.
+  await result(job, 'stale');
+  const delivered = await poll('studio');
+  assert.equal(delivered.code, 'next');
+  await result(delivered);
   assert.equal(await next, 'done');
  });
 }
+
+test('a run started while another is held is refused with a way out', async t => {
+ const {bridge, poll} = await fixture(t);
+ const first = bridge.runJob('code', 5000);
+ const firstRejected = assert.rejects(first, /cancelled and released/);
+ await poll('studio');
+ await assert.rejects(bridge.runJob('next', 5000), /lunit-cli --cancel/);
+ bridge.abandonCurrentJob('cancelled and released');
+ await firstRejected;
+});
+
+test('POST /cancel (lunit-cli --cancel) releases a hung job and the next run starts cleanly', async t => {
+ const {bridge, poll, cancelAll, heartbeat, result} = await fixture(t);
+ const hung = bridge.runJob('hung', 5000);
+ const rejected = assert.rejects(hung, /lunit-cli --cancel/);
+ const job = await poll('studio');
+ assert.deepEqual(await cancelAll(), {releasedJob: true, cancelledRuns: 0});
+ await rejected;
+ assert.deepEqual(await heartbeat(job, 'studio'), {active: false});
+ assert.deepEqual(await cancelAll(), {releasedJob: false, cancelledRuns: 0});
+ const next = bridge.runJob('next', 5000);
+ await result(await poll('studio'));
+ assert.equal(await next, 'done');
+});
+
+test('POST /cancel also cancels a CLI run waiting on a hung job', async t => {
+ const {bridge, url, poll, cancelAll} = await fixture(t);
+ let seenCancel = false;
+ bridge.runHandler = async (request, onOutput, cancel) => {
+  cancel.onCancellationRequested(() => { seenCancel = true; });
+  try {
+   await bridge.runJob('hung', 5000, cancel);
+  } catch (err) {
+   return {via: 'studio', cancelled: true, tests: [], counts: {passed: 0, failed: 0, skipped: 0, errored: 0}, error: String(err)};
+  }
+ };
+ const response = fetch(url + '/run', {method: 'POST', body: JSON.stringify({cwd: '/x', via: 'studio', filters: []})});
+ while (!bridge.hasActiveJob) await sleep(5);
+ await poll('studio');
+ assert.deepEqual(await cancelAll(), {releasedJob: true, cancelledRuns: 1});
+ assert.equal(seenCancel, true);
+ assert.equal(bridge.hasActiveJob, false);
+ assert.match(await (await response).text(), /@@LUNIT_SUMMARY@@/);
+});
+
+test('a Studio restart (new plugin session) releases a job the old session held', async t => {
+ const {bridge, poll, result} = await fixture(t);
+ const held = bridge.runJob('code', 30000);
+ const rejected = assert.rejects(held, /new plugin session/);
+ await poll('old-studio');
+ // The new session polls while the old one is still heartbeating: a second
+ // Studio on the same window, not a restart -- the job stays.
+ await poll('new-studio');
+ assert.equal(bridge.hasActiveJob, true);
+ await sleep(2700);
+ // The old session has gone quiet; the new session's poll releases it.
+ const afterRestart = await poll('new-studio');
+ assert.equal(afterRestart.jobId, null);
+ await rejected;
+ const next = bridge.runJob('next', 5000);
+ const delivered = await poll('new-studio');
+ assert.equal(delivered.code, 'next');
+ await result(delivered);
+ assert.equal(await next, 'done');
+});
+
+test('a delivered job whose Studio stops sending heartbeats is released', async t => {
+ const {bridge, poll, heartbeat, result} = await fixture(t);
+ bridge.heartbeatTimeoutMs = 150;
+ const kept = bridge.runJob('busy', 5000);
+ const job = await poll('studio');
+ for (let i = 0; i < 6; i++) {
+  await sleep(50);
+  assert.deepEqual(await heartbeat(job, 'studio'), {active: true}, 'heartbeats keep a long job alive');
+ }
+ await result(job);
+ assert.equal(await kept, 'done');
+ const lost = bridge.runJob('lost', 5000);
+ const rejected = assert.rejects(lost, /stopped responding/);
+ await poll('studio');
+ await rejected;
+ assert.equal(bridge.hasActiveJob, false);
+ // An old plugin (no session id) is never timed out by heartbeat.
+ const legacy = bridge.runJob('legacy', 5000);
+ const legacyJob = await poll();
+ await sleep(300);
+ assert.equal(bridge.hasActiveJob, true);
+ await result(legacyJob);
+ assert.equal(await legacy, 'done');
+});
 test('pre-cancelled and undelivered jobs never execute', async t => {
  const {bridge, poll} = await fixture(t);
  const cancel = new CancelSource();

@@ -36,7 +36,7 @@ import { CancelSource } from './cancelSignal';
 import { buildConfig, DEFAULT_LIVE_SYNC_PORT, LunitConfig, SettingReader } from './config';
 import { discoverBridges, matchingBridges } from './bridgeDiscovery';
 import { parseTestFile } from './discovery';
-import { CliRunRequest, LiveSyncBridge } from './liveSyncBridge';
+import { CancelReport, CliRunRequest, LiveSyncBridge } from './liveSyncBridge';
 import { buildTestSelection } from './luauTestFilterTemplate';
 import { LuneRunOutcome, RunOutcome, runViaLune } from './luneRunner';
 import { createResultLineFilter, parseResultLines } from './resultProtocol';
@@ -68,6 +68,8 @@ interface CliArgs {
 	port?: number;
 	workspace?: string;
 	standalone: boolean;
+	/** --cancel / --reset: cancel and release this workspace's live-sync run in its VS Code window, then exit. */
+	cancel: boolean;
 	help: boolean;
 	filters: string[];
 }
@@ -90,16 +92,25 @@ Options:
   --workspace <dir> Workspace folder to use when running standalone (default: nearest
                     ancestor of the current directory containing package.json).
   --standalone      Don't route through a running VS Code window even if one is listening.
+  --cancel          Cancel any run in progress through this workspace's VS Code window and
+                    release its Roblox Studio live-sync run at once, even when Studio never
+                    reports back (the plugin abandons the job). No VS Code reload needed.
+                    Runs nothing; with --port, targets exactly that window. Alias: --reset.
   -h, --help        Show this help.
 
 Filters (optional, any number): case-insensitive substrings matched against each test's
 workspace-relative file path, class name, method name and display name. A test runs if
 ANY filter matches it. No filters runs every test eligible for the chosen profile.
 
-Exit code: 0 all passed/skipped, 1 any failed/errored, 2 could not run, 130 cancelled.`;
+A live-sync run never hangs for good: each test module gets lunit.studio.liveSync.loadTimeoutSeconds
+(default 10) to load, and the whole run lunit.studio.liveSync.timeoutSeconds; a module that times out
+is reported as errored and the rest still run.
+
+Exit code: 0 all passed/skipped, 1 any failed/errored, 2 could not run, 130 cancelled.
+With --cancel: 0 when a window was reached, 2 when none was found.`;
 
 function parseArgs(argv: string[]): CliArgs {
-	const args: CliArgs = { via: 'studio', full: false, json: false, standalone: false, help: false, filters: [] };
+	const args: CliArgs = { via: 'studio', full: false, json: false, standalone: false, cancel: false, help: false, filters: [] };
 	let studioRequested = false;
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
@@ -139,6 +150,10 @@ function parseArgs(argv: string[]): CliArgs {
 				break;
 			case '--standalone':
 				args.standalone = true;
+				break;
+			case '--cancel':
+			case '--reset':
+				args.cancel = true;
 				break;
 			case '--port': {
 				const port = Number(takeValue());
@@ -406,6 +421,53 @@ function discoverTests(config: LunitConfig, warn: (message: string) => void): Di
 // Route 1: through the running VS Code extension
 // ---------------------------------------------------------------------------
 
+/** POSTs /cancel to one bridge; resolves with its report, or undefined if it could not be reached. */
+function postCancel(port: number, instanceId: string | undefined): Promise<CancelReport | undefined> {
+	return new Promise((resolve) => {
+		const query = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+		const req = http.request({ host: '127.0.0.1', port, path: '/cancel' + query, method: 'POST' }, (res) => {
+			let body = '';
+			res.setEncoding('utf8');
+			res.on('data', (chunk: string) => { body += chunk; });
+			res.on('end', () => {
+				try {
+					const report = JSON.parse(body) as CancelReport;
+					resolve(res.statusCode === 200 ? report : undefined);
+				} catch {
+					resolve(undefined);
+				}
+			});
+			res.on('error', () => resolve(undefined));
+		});
+		req.setTimeout(3000, () => req.destroy());
+		req.on('error', () => resolve(undefined));
+		req.end();
+	});
+}
+
+/** lunit-cli --cancel: releases the live-sync run in the window(s) holding this workspace. */
+async function cancelThroughExtension(args: CliArgs, port: number, cwd: string, live: (text: string) => void): Promise<number> {
+	const discovered = await discoverBridges(port, args.port === undefined ? undefined : 1);
+	const targets = args.port !== undefined
+		? [{ port: args.port, instanceId: discovered[0]?.instanceId }]
+		: matchingBridges(discovered, args.workspace ?? cwd).map((bridge) => ({ port: bridge.port, instanceId: bridge.instanceId as string | undefined }));
+	if (targets.length === 0) {
+		live(`[lunit] no VS Code window with this workspace was found on ports ${port}+; nothing to cancel.\n`);
+		return 2;
+	}
+	let reached = 0;
+	for (const target of targets) {
+		const report = await postCancel(target.port, target.instanceId);
+		if (!report) {
+			live(`[lunit] could not cancel through port ${target.port}: no Lunit VS Code window answered (none is listening there, or its extension is older than 0.9.0, which has no --cancel).\n`);
+			continue;
+		}
+		reached++;
+		live(`[lunit] port ${target.port}: ${report.releasedJob ? 'released the live-sync run' : 'no live-sync run was held'}; cancelled ${report.cancelledRuns} CLI run(s).\n`);
+	}
+	return reached > 0 ? 0 : 2;
+}
+
 type ExtensionRunResult =
 	| { kind: 'not-listening' }
 	| { kind: 'refused'; message: string }
@@ -557,6 +619,7 @@ async function runStandalone(
 						bridge,
 						args.filters.length > 0 ? buildTestSelection(leaves) : undefined,
 						slowFilter,
+						args.filters.length > 0 ? leaves.map((leaf) => leaf.file) : undefined,
 					);
 	} catch (err) {
 		displayFilter.flush();
@@ -640,6 +703,9 @@ async function main(): Promise<number> {
 	const settings = createSettingReader(readWorkspaceSettings(workspaceRoot, live));
 	const config = buildConfig(workspaceRoot, standaloneStorageDir(workspaceRoot), settings);
 	const port = args.port ?? config.studio.liveSync.port;
+	if (args.cancel) {
+		return cancelThroughExtension(args, port, cwd, live);
+	}
 
 	const cancel = new CancelSource();
 	const onSigint = () => {

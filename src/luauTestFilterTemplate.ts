@@ -21,7 +21,7 @@ export function buildTestSelection(tests: readonly TestIdentity[]): TestSelectio
 }
 
 /** A Luau string literal for arbitrary text (bytes outside printable ASCII become \ddd escapes). */
-function luauString(text: string): string {
+export function luauString(text: string): string {
 	let out = '"';
 	for (const byte of Buffer.from(text, 'utf8')) {
 		const char = String.fromCharCode(byte);

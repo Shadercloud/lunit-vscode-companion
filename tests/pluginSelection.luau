@@ -19,6 +19,8 @@ local panelIds = {}
 local panelOrder = {}
 local savedSettings = {}
 local scenario = process.args[2]
+-- abandon-hung-job: what the plugin saw and did with a job that never returns.
+local hung = {polls = 0, heartbeats = 0, posted = false, cleaned = false, pollsAfterAbandon = 0}
 if scenario == 'remembered-workspace' then
  savedSettings.LunitSelectedWorkspace = '/project34874'
  expectedPort = 34874
@@ -104,6 +106,20 @@ function http:RequestAsync(request)
  end
  assert(port == expectedPort, 'must not poll or post results to the unselected workspace')
  assert(request.Url:find('instanceId=id' .. tostring(expectedPort), 1, true), 'missing selected window identity')
+ if scenario == 'abandon-hung-job' then
+  assert(request.Url:find('session=', 1, true), 'every bridge request must name its plugin session')
+  if request.Method == 'POST' then hung.posted = true; return {Success = true} end
+  if request.Url:find('/heartbeat', 1, true) then
+   assert(request.Url:find('jobId=hung', 1, true), 'heartbeat must name its job')
+   hung.heartbeats += 1
+   -- VS Code keeps the job for one heartbeat, then the user presses Stop.
+   return {Success = true, Body = {active = hung.heartbeats < 2}}
+  end
+  hung.polls += 1
+  if hung.polls == 1 then return {Success = true, Body = {jobId = 'hung', code = 'local owner = ...\nowner.cleanup = CLEANED\ncoroutine.yield()\nreturn "never"'}} end
+  if hung.cleaned then hung.pollsAfterAbandon += 1 end
+  return {Success = true, Body = {}}
+ end
  if port == 34873 then return {Success = true, Body = {}} end
  if stale then return {Success = false, StatusCode = 409} end
  if request.Method == 'POST' then
@@ -118,7 +134,9 @@ local environment = {
  DockWidgetPluginGuiInfo = {new = function(...) return {...} end},
  game = {GetService = function() return http end, PlaceId = 0, Name = 'Test Place'},
  plugin = plugin, task = task, print = function(message) table.insert(prints, message) end, warn = function(message) table.insert(warnings, message) end,
- loadstring = function(code) return luau.load(code) end,
+ loadstring = function(code)
+  return luau.load(code, {environment = {CLEANED = function() hung.cleaned = true end}, injectGlobals = true})
+ end,
 }
 luau.load(fs.readFile(process.args[1]), {environment = environment, injectGlobals = true})()
 task.wait(0.02)
@@ -155,6 +173,25 @@ if scenario == 'debug-startup' then
  assert(#warnings == 1 and warnings[1]:find('No compatible workspaces', 1, true), 'debug must report an empty startup scan')
  unloading()
  print('Debug startup regression checks passed')
+ process.exit(0)
+end
+if scenario == 'abandon-hung-job' then
+ -- Startup connects to the first window, which delivers a job that never
+ -- returns. When VS Code stops wanting it, the plugin cancels it, cleans up,
+ -- posts nothing and goes back to polling: no Studio restart needed.
+ local deadline = os.clock() + 8
+ while hung.pollsAfterAbandon == 0 and os.clock() < deadline do task.wait(0.05) end
+ assert(hung.heartbeats >= 2, 'a running job must heartbeat')
+ assert(hung.cleaned, 'an abandoned job must be cleaned up')
+ assert(not hung.posted, 'an abandoned job must not post a result')
+ assert(hung.pollsAfterAbandon > 0, 'the bridge must poll again after abandoning a job')
+ local abandonWarning = false
+ for _, message in warnings do
+  if message:find('stopped or released the running test job', 1, true) then abandonWarning = true end
+ end
+ assert(abandonWarning, 'abandoning must say so: ' .. table.concat(warnings, '\n'))
+ unloading()
+ print('Hung job abandonment regression checks passed')
  process.exit(0)
 end
 if scenario == 'panel-layout-owned' then

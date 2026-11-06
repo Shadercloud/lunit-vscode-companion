@@ -394,6 +394,14 @@ export function activate(context: vscode.ExtensionContext): void {
 				`Lunit: ${updated ? 'updated the Lunit section in' : 'created'} ${path.basename(filePath)} with instructions for coding agents on writing @rbxts/lunit tests for this project.`,
 			);
 		}),
+		vscode.commands.registerCommand('lunit.resetLiveSync', () => {
+			const report = liveSyncBridge?.cancelAll('the live-sync run was cancelled and released (Lunit: Cancel and Release the Roblox Studio Live-Sync Run)');
+			const message = report?.releasedJob
+				? 'Lunit: released the Roblox Studio live-sync run. Studio abandons the job at its next heartbeat; the next run can start now.'
+				: 'Lunit: no Roblox Studio live-sync run was held; nothing to release.';
+			outputChannel.appendLine(`[lunit] ${message.slice('Lunit: '.length)}`);
+			vscode.window.showInformationMessage(message);
+		}),
 		vscode.commands.registerCommand('lunit.showLiveSyncStatus', async () => {
 			if (liveSyncBridge?.connectionError) {
 				vscode.window.showErrorMessage(`Lunit: ${liveSyncBridge.connectionError}`);
@@ -957,7 +965,7 @@ async function executeRun(
 
 	let outcome: RunOutcome;
 	try {
-		outcome = await runViaStudio(config, token, chunkSink, liveSyncBridge, selection, slowFilter);
+		outcome = await runViaStudio(config, token, chunkSink, liveSyncBridge, selection, slowFilter, selection ? identities.map((identity) => identity.file) : undefined);
 	} catch (err) {
 		const message = failRun(err);
 		const results = applyVerdicts(run, leaves, () => ({ status: 'errored', message }));

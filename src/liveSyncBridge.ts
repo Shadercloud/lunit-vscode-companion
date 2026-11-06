@@ -32,6 +32,22 @@ export type CliRunHandler = (
 export const BRIDGE_PORT_COUNT = 20;
 export interface BridgeWorkspace { name: string; path: string }
 
+/** What `POST /cancel` (lunit-cli --cancel) and the reset command report. */
+export interface CancelReport {
+	/** A Studio job was held (queued, or delivered and awaited) and has been released. */
+	releasedJob: boolean;
+	/** CLI-initiated runs in flight that were cancelled. */
+	cancelledRuns: number;
+}
+
+/**
+ * A delivered job's plugin heartbeats (see studioPluginTemplate.ts) arrive
+ * about once a second. When a *different* plugin session polls and the owning
+ * session has been silent this long, the Studio that took the job is gone
+ * (restarted, or its plugin reloaded) and the job is released at once.
+ */
+const SESSION_SWITCH_SILENCE_MS = 2500;
+
 /**
  * Local (127.0.0.1-only) HTTP server the companion Studio plugin
  * (studioPluginTemplate.ts) polls for on-demand test-run jobs. Deliberately
@@ -57,7 +73,23 @@ export class LiveSyncBridge {
 	private retryTimer: ReturnType<typeof setTimeout> | undefined;
 	private listenError: NodeJS.ErrnoException | undefined;
 	private lastPluginSeenAt = 0;
-	private currentJob: { id: string; code: string; delivered: boolean; resolve: (output: string) => void } | undefined;
+	private currentJob: {
+		id: string;
+		code: string;
+		delivered: boolean;
+		/** The plugin session (one per loaded plugin) the job was delivered to. */
+		session?: string;
+		lastHeartbeat: number;
+		resolve: (output: string) => void;
+		fail: (err: Error) => void;
+	} | undefined;
+	private readonly cliRuns = new Set<CancelSource>();
+	/**
+	 * A delivered job whose plugin has sent no heartbeat for this long is
+	 * released: Studio was closed, crashed or restarted. Only applies to
+	 * plugins that report a session id (all current ones do).
+	 */
+	heartbeatTimeoutMs = 15000;
 	private jobCounter = 0;
 	private candidatePort = this.port;
 	private readonly instanceId = randomUUID();
@@ -123,35 +155,36 @@ export class LiveSyncBridge {
 
 	/**
 	 * Queues `code` for the next plugin poll and resolves with whatever it
-	 * returns once the plugin posts a result back, or rejects on timeout.
-	 * Only one job may be in flight at a time (the plugin itself only ever
-	 * runs one job per poll cycle anyway).
+	 * returns once the plugin posts a result back, or rejects on timeout,
+	 * cancellation, `abandonCurrentJob`, or a Studio that stops sending
+	 * heartbeats. Only one job may be in flight at a time.
+	 *
+	 * The run lock never outlives the caller's wait: however the wait ends,
+	 * the job is released at once. A plugin still executing a released job
+	 * learns from its next heartbeat (`active: false`) and cancels it before
+	 * it polls again, so the next job never runs alongside the old one.
 	 */
 	runJob(code: string, timeoutMs: number, cancelSignal?: CancelSignal): Promise<string> {
 		if (cancelSignal?.isCancellationRequested) {
 			return Promise.reject(new Error('cancelled'));
 		}
 		if (this.currentJob) {
-			return Promise.reject(new Error('a live-sync test run is still executing or awaiting cleanup acknowledgement in Studio'));
+			return Promise.reject(new Error('another live-sync test run is executing in Studio right now. Wait for it, stop it, or release it with "Lunit: Cancel and Release the Roblox Studio Live-Sync Run" (or lunit-cli --cancel)'));
 		}
 		return new Promise<string>((resolve, reject) => {
 			const id = `job-${++this.jobCounter}-${Date.now()}`;
 
 			let settled = false;
 			let cancelSub: { dispose(): void } | undefined;
-			const settle = (fn: () => void, drain = false) => {
+			const settle = (fn: () => void) => {
 				if (settled) { return; }
 				settled = true;
-				if (this.currentJob?.id === id && !(drain && this.currentJob.delivered)) {
+				if (this.currentJob?.id === id) {
 					this.currentJob = undefined;
-				}
-				if (drain && this.currentJob?.id === id) {
-					// Keep only the acknowledgement lock after the caller has left.
-					this.currentJob.code = '';
-					this.currentJob.resolve = () => {};
 				}
 				cancelSub?.dispose();
 				clearTimeout(timeoutHandle);
+				clearInterval(watchdog);
 				fn();
 			};
 
@@ -159,25 +192,64 @@ export class LiveSyncBridge {
 				settle(() =>
 					reject(
 						new Error(
-							`timed out after ${Math.round(timeoutMs / 1000)}s waiting for the Roblox Studio plugin to run the tests and report back; delivered jobs retain the run lock until Studio finishes and acknowledges cleanup`,
+							`timed out after ${Math.round(timeoutMs / 1000)}s waiting for the Roblox Studio plugin to run the tests and report back; the run was released and Studio told to abandon the job`,
 						),
 					),
-					true,
 				);
 			}, timeoutMs);
+
+			const watchdog = setInterval(() => {
+				const job = this.currentJob;
+				if (job?.id === id && job.delivered && job.session && Date.now() - job.lastHeartbeat > this.heartbeatTimeoutMs) {
+					settle(() => reject(new Error(
+						`Roblox Studio stopped responding while running the tests (no plugin heartbeat for ${Math.round(this.heartbeatTimeoutMs / 1000)}s): it was probably closed, restarted, or its Lunit plugin reloaded. The run was released.`,
+					)));
+				}
+			}, Math.min(1000, Math.max(10, Math.floor(this.heartbeatTimeoutMs / 4))));
+			watchdog.unref?.();
 
 			this.currentJob = {
 				id,
 				code,
 				delivered: false,
+				lastHeartbeat: Date.now(),
 				resolve: (output) => settle(() => resolve(output)),
+				fail: (err) => settle(() => reject(err)),
 			};
 			cancelSub = cancelSignal?.onCancellationRequested(() => {
-				settle(() => reject(new Error('cancelled')), true);
+				settle(() => reject(new Error('cancelled')));
 			});
 			if (settled) { cancelSub?.dispose(); }
 
 		});
+	}
+
+	/** True while a job is queued or delivered and its caller is still waiting for it. */
+	get hasActiveJob(): boolean {
+		return this.currentJob !== undefined;
+	}
+
+	/**
+	 * Releases the run lock now, failing the waiting run with `reason`. A
+	 * plugin still running the job abandons it at its next heartbeat. Returns
+	 * whether there was a job to release.
+	 */
+	abandonCurrentJob(reason: string): boolean {
+		const job = this.currentJob;
+		if (!job) { return false; }
+		job.fail(new Error(reason));
+		return true;
+	}
+
+	/** `lunit-cli --cancel` and the reset command: cancels CLI runs in flight and releases any held job. */
+	cancelAll(reason: string): CancelReport {
+		// Cancelling a run waiting on the job already releases it; report the
+		// job as released either way.
+		const held = this.hasActiveJob;
+		const runs = [...this.cliRuns];
+		for (const run of runs) { run.cancel(); }
+		this.abandonCurrentJob(reason);
+		return { releasedJob: held, cancelledRuns: runs.length };
 	}
 
 	private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
@@ -195,17 +267,54 @@ export class LiveSyncBridge {
 			res.end('The selected VS Code window has closed. Select a window again in Studio.');
 			return;
 		}
+		const session = url.searchParams.get('session') ?? undefined;
 		if (req.method === 'GET' && url.pathname === '/poll') {
 			this.lastPluginSeenAt = Date.now();
 			res.setHeader('Content-Type', 'application/json');
+			const held = this.currentJob;
+			// A new plugin session polling while the session holding the job has
+			// gone quiet: Studio restarted or the plugin reloaded mid-job. The old
+			// job can never report back, so release it now instead of at timeout.
+			if (held?.delivered && held.session && session && session !== held.session
+				&& Date.now() - held.lastHeartbeat > SESSION_SWITCH_SILENCE_MS) {
+				held.fail(new Error('Roblox Studio reconnected with a new plugin session (Studio restarted or the Lunit plugin reloaded) before the delivered job reported back. The run was released.'));
+			}
 			const job = this.currentJob;
 			if (job && !job.delivered) {
 				job.delivered = true;
+				job.session = session;
+				job.lastHeartbeat = Date.now();
 				res.end(JSON.stringify({ jobId: job.id, code: job.code }));
 				job.code = '';
 			} else {
 				res.end(JSON.stringify({ jobId: null }));
 			}
+			return;
+		}
+
+		// While a plugin executes a job it reports in about once a second. The
+		// answer tells it whether anyone still wants the job; when not, it
+		// cancels the job and cleans up before polling again.
+		if (req.method === 'GET' && url.pathname === '/heartbeat') {
+			this.lastPluginSeenAt = Date.now();
+			const job = this.currentJob;
+			const active = job !== undefined && job.delivered && job.id === url.searchParams.get('jobId');
+			if (job && active) {
+				job.lastHeartbeat = Date.now();
+				job.session ??= session;
+			}
+			res.setHeader('Content-Type', 'application/json');
+			res.end(JSON.stringify({ active }));
+			return;
+		}
+
+		if (req.method === 'POST' && url.pathname === '/cancel') {
+			req.resume();
+			req.on('end', () => {
+				const report = this.cancelAll('the live-sync run was cancelled and released (lunit-cli --cancel)');
+				res.setHeader('Content-Type', 'application/json');
+				res.end(JSON.stringify(report));
+			});
 			return;
 		}
 
@@ -285,6 +394,7 @@ export class LiveSyncBridge {
 			res.flushHeaders();
 
 			const cancel = new CancelSource();
+			this.cliRuns.add(cancel);
 			res.on('close', () => {
 				if (!res.writableFinished) {
 					cancel.cancel();
@@ -296,6 +406,7 @@ export class LiveSyncBridge {
 					res.write(text);
 				}
 			}, cancel.token)
+				.finally(() => this.cliRuns.delete(cancel))
 				.then((summary) => {
 					if (!res.writableEnded) {
 						res.end(`\n${SUMMARY_MARKER}${JSON.stringify(summary)}\n`);

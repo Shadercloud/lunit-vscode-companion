@@ -109,7 +109,7 @@ end
 local expectedTests = 100
 local function run(expectError)
  local originalCount = #game:GetDescendants()
- local owner = {}
+ local owner = {protocol = 2}
  local fn = luau.load(code, {environment = environment, injectGlobals = true})
  local finished, succeeded, output = false, false, nil
  task.spawn(function()
@@ -210,7 +210,7 @@ assert(not scriptAncestor:find('skipped', 1, true), scriptAncestor)
 local model = node('Model', 'unsupported', rs)
 node('ModuleScript', 'nested', model, 'return {}')
 local skipWarning = run(false)
-assert(skipWarning:find('1 module(s) skipped (unsupported ancestor)', 1, true), skipWarning)
+assert(skipWarning:find('1 module(s) skipped: game.ReplicatedStorage.unsupported.nested (isolation: unsupported module ancestor', 1, true), skipWarning)
 assert(skipWarning:find('ReplicatedStorage.unsupported.nested', 1, true), skipWarning)
 model:Destroy()
 -- A test whose own ancestor is unsupported is reported as that test failing to

@@ -129,6 +129,9 @@ ${cliCommand(cliLauncherPath, '--studio')}
 - Studio runs can take a while (up to a few minutes if a new Studio process
   has to be launched); wait for the command to finish rather than assuming
   it hung. Use \`--help\` for every option.
+- If a Studio run is refused because another live-sync run is executing, and
+  no run of yours is in progress, \`... --cancel\` releases it at once. Never
+  ask for a VS Code reload or a Studio restart for that.
 ${END_MARKER}`;
 }
 

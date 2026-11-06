@@ -298,9 +298,17 @@ The rule is enforced at both ends:
   loaded. When you run a selection rather than everything, Studio runs just the selected classes and
   methods.
 
-Studio yields a frame between test classes at least every 50 ms, so a long run doesn't freeze it. In
-live-sync mode the run also stops starting new classes once `lunit.studio.liveSync.timeoutSeconds` has
-passed, because by then VS Code has stopped waiting for results.
+Studio yields a frame between test classes at least every 50 ms, so a long run doesn't freeze it.
+
+**A live-sync run never hangs for good.** Each test module gets `lunit.studio.liveSync.loadTimeoutSeconds`
+(default 10) to load. A module still loading after that (typically one waiting with `WaitForChild` for a
+child that isn't there) is cancelled, its tests are reported as errored with the module and child it was
+waiting on, and the rest of the run goes ahead. `lunit.studio.liveSync.timeoutSeconds` bounds the whole
+run: no module starts after it, and a test class still running then is cancelled. A selected run loads
+only the test modules that hold the selected tests. If a run does go wrong, **Stop** in the Testing view,
+**Lunit: Cancel and Release the Roblox Studio Live-Sync Run** or `lunit-cli --cancel` frees it at once,
+and closing or restarting Studio frees it within seconds. You never need to reload VS Code or restart
+Studio to run again. See [Studio live-sync isolation](docs/live-sync.md).
 
 **"A plugin is taking a long time to run. Do you want to stop it?"** -- Studio shows this popup when one
 script runs without yielding for longer than its script timeout (10 seconds by default). The total run
@@ -461,6 +469,8 @@ installed version, so the path stays stable across extension updates. Options:
   test (`file`, `className`, `methodName`, `displayName`, `status`, `message`, `elapsedMs`) plus `counts`.
 - Exit code 0 = every test passed or was skipped, 1 = at least one failed or errored, 2 = the run couldn't be
   performed at all (the reason is printed), 130 = cancelled with Ctrl+C.
+- `--cancel` (alias `--reset`) runs nothing: it cancels any run in progress through this workspace's VS Code
+  window and releases its Roblox Studio live-sync run at once, even when Studio never reports back.
 - `--help` lists everything, including `--port`, `--workspace` and `--standalone`.
 
 How it works, and why the results are identical to clicking in the Test Explorer:

@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.9.0
+
+A Studio live-sync run can no longer hang for good, and one that goes wrong no longer needs a restart of
+Studio or a reload of VS Code to recover. **Reinstall the Studio plugin** (Lunit: Install Roblox Studio
+Live-Sync Plugin, then restart Studio or reload the plugin): runs through an older loaded plugin stop with
+"the loaded Studio bridge is outdated".
+
+### Fixed
+
+- **A require that never returns no longer stalls every run.** Each test module now gets
+  **`lunit.studio.liveSync.loadTimeoutSeconds`** (new, default 10) to load. A module still loading then is
+  cancelled and reported as failing to load, for example `timed out after 10 s loading <module> (waiting
+  on child "animal-poses.generated" at <module>:<line>)`. The rest
+  of the run goes ahead, and other tests importing the same module fail at once instead of waiting
+  again. `lunit.studio.liveSync.timeoutSeconds` is now a whole-run watchdog: no module starts after it,
+  and a test class still running then is cancelled.
+- **Large modules are no longer skipped.** The snapshot used to copy each module's `Source`, which Studio
+  refuses above about 200,000 characters, so a large generated module was left out (and reported as an
+  "unsupported ancestor"). The loader already compiles from its own copy of the source, so the clone's
+  `Source` stays empty and modules of any size load.
+- **A skipped module fails instead of hanging.** A module still left out of the snapshot (one under a
+  Model, say) gets a stub in its place, so `WaitForChild` and `TS.import` find it and requiring it fails
+  with the reason. The warning now gives that reason and the module's source length, not "unsupported
+  ancestor".
+- **Non-module children are there to wait for.** A LocalScript, Script, Actor, value object, RemoteEvent or
+  Model next to snapshotted modules gets an empty placeholder of the same class and name, disabled, with no
+  source, and value objects keep their `Value`. Packages such as smartbone, which wait for
+  `Dependencies.Runtime`, now load. A `TS.import` path part that is not in the snapshot fails at once with
+  `<path> has no child "<name>"`.
+- **The run lock always releases.** Stop in the Testing view, Ctrl+C on the CLI and the timeout now release
+  the run at once, even when Studio never reports back, and the plugin abandons the job at its next
+  heartbeat (about once a second). Closing or restarting Studio, or reloading its plugin, releases a job
+  that Studio was running. A run is no longer refused with "still executing or awaiting cleanup
+  acknowledgement" until VS Code is reloaded.
+- **A filtered Studio run loads only the test modules holding the selected tests**, so a broken module
+  elsewhere in the place cannot affect it.
+
+### Added
+
+- **`lunit-cli --cancel`** (alias `--reset`): cancels any run in progress through this workspace's VS Code
+  window and releases its live-sync run. It runs no tests.
+- **Lunit: Cancel and Release the Roblox Studio Live-Sync Run** does the same from the Command Palette.
+
 ## 0.8.1
 
 ### Fixed
