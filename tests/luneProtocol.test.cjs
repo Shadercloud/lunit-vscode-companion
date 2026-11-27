@@ -243,3 +243,13 @@ test('the parallel settings default to enabled, automatic workers and no groups,
 	assert.deepEqual(read({ 'lune.parallel.dependencyGroups': [[' a.test ', 'b.test', ''], 'lonely', [1, 'c']] }).dependencyGroups, [['a.test', 'b.test'], ['lonely'], ['1', 'c']]);
 	assert.deepEqual(read({ 'lune.parallel.dependencyGroups': 'nope' }).dependencyGroups, []);
 });
+
+test('a block summary carries coverage counts, with string line keys decoded and bad entries dropped', () => {
+	const withCoverage = { ...summary(1), coverage: { 'src/a.ts': { 3: 2, 7: 0, x: 1, '-1': 1, 9: 'many' }, 'src/b.ts': {} } };
+	assert.deepEqual(parseBlockSummary(lines(summaryLine(withCoverage))).coverage, {
+		'src/a.ts': { 3: 2, 7: 0 },
+		'src/b.ts': {},
+	});
+	assert.equal('coverage' in parseBlockSummary(lines(summaryLine(summary(1)))), false, 'absent without coverage');
+	assert.equal(parseBlockSummary(lines(summaryLine({ ...summary(1), coverage: [1, 2] }))).coverage, undefined);
+});
