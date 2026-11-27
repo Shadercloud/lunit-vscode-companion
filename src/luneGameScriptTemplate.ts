@@ -198,7 +198,7 @@ local failed, loadFailures, elapsedMs = lunitRunJob(job, function(fullName)
 	end
 	return dataModel.require(module)
 end, lunit)
-lunitEmitBlockSummary(job.block, failed, loadFailures, elapsedMs)
+lunitEmitBlockSummary(job.block, failed, loadFailures, elapsedMs, dataModel.globals)
 process.exit((failed > 0 or #loadFailures > 0) and 1 or 0)
 `;
 }

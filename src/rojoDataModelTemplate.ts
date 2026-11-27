@@ -377,7 +377,7 @@ function rbx.readProject(projectFile)
 end
 
 -- Builds the DataModel described by projectFile and returns the handle the
--- generated runner uses: { game, require, isInstance, sourcePath, environmentFor }.
+-- generated runner uses: { game, require, isInstance, sourcePath, environmentFor, globals }.
 function rbx.loadProject(projectFile)
 	local project = rbx.readProject(projectFile)
 	if type(project) ~= "table" or type(project.tree) ~= "table" then
@@ -519,6 +519,8 @@ function rbx.loadProject(projectFile)
 			return rawget(instance, "_source")
 		end,
 		environmentFor = environmentFor,
+		-- The _G every module of this DataModel shares (not the runner's own).
+		globals = sharedG,
 	}
 end
 
