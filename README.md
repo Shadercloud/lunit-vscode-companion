@@ -455,6 +455,33 @@ queued to running to their verdict as their block starts and finishes.
 Generated scripts and job files are written to a per-run directory under the extension's storage, so two
 runs at once (say the Test Explorer and the command line) never overwrite each other's files.
 
+### Coverage
+
+**Run with Lune (Coverage)** shows which lines your tests ran: covered and missed lines in the editor
+gutter, and a summary per file in VS Code's **Test Coverage** view. It needs VS Code 1.88 or later and
+`@rbxts/lunit` 4.3 or later, whose coverage transformer counts the lines.
+
+Add a `tsconfig.coverage.json` next to your `tsconfig.json`:
+
+```json
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"plugins": [{ "transform": "@rbxts/lunit/transformer" }]
+	}
+}
+```
+
+The coverage profile compiles with **`lunit.coverage.compileCommand`** (default
+`npx rbxtsc -p tsconfig.coverage.json`), even when `lunit.skipCompile` is on, then runs like
+**Run with Lune**. Each Lune worker reports its own counts, and the extension adds them up. The next
+normal run compiles with `lunit.compileCommand` again, and roblox-ts rebuilds every file when the config
+changes, so the counters do not stay in your build.
+
+Test files are not counted. For what counts as a line, see
+[Lunit's coverage guide](https://docs.kong.ly/lunit/guides/coverage.html). The Roblox Studio profile does
+not report coverage yet.
+
 ## Running tests from the command line (for coding agents)
 
 Nothing outside VS Code can press the Test Explorer's Run button, so the extension ships a command-line
