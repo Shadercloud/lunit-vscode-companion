@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Coverage.** A new **Run with Lune (Coverage)** profile shows line coverage in the editor gutter and in
+  VS Code's Test Coverage view. It compiles with the new **`lunit.coverage.compileCommand`** setting
+  (default `npx rbxtsc -p tsconfig.coverage.json`), which must use `@rbxts/lunit/transformer`
+  (Lunit 4.3+). Each Lune worker adds its line counts to its block summary, and the extension adds them up.
+  The profile appears in VS Code 1.88 and later.
+
 ## 0.10.1
 
 ### Fixed

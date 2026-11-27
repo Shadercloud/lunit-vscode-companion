@@ -27,6 +27,23 @@ test('the Full profile is registered only when lunit.lune.slowTags names a tag',
 	);
 });
 
+test('the coverage profile is registered only when VS Code has the coverage API, and defaults its own kind', () => {
+	assert.deepEqual(ids({ studioEnabled: true, slowTags: [], coverageSupported: false }), ['lune', 'studio']);
+	assert.deepEqual(ids({ studioEnabled: true, slowTags: [], coverageSupported: true }), ['lune', 'luneCoverage', 'studio']);
+	const coverage = runProfileSpecs({ studioEnabled: false, slowTags: [], coverageSupported: true }).find((spec) => spec.coverage);
+	assert.deepEqual(coverage, {
+		id: 'luneCoverage',
+		label: 'Run with Lune (Coverage)',
+		via: 'lune',
+		includeSlow: false,
+		isDefault: true,
+		coverage: true,
+	});
+	const read = (settings) => buildConfig('/ws', '/storage', (key, fallback) => (key in settings ? settings[key] : fallback));
+	assert.equal(read({}).coverage.compileCommand, 'npx rbxtsc -p tsconfig.coverage.json');
+	assert.equal(read({ 'coverage.compileCommand': 'npm run build:coverage' }).coverage.compileCommand, 'npm run build:coverage');
+});
+
 test('lunit.lune.slowTags defaults to empty and ignores blank or non-string entries', () => {
 	const read = (settings) => buildConfig('/ws', '/storage', (key, fallback) => (key in settings ? settings[key] : fallback));
 	assert.deepEqual(read({}).lune.slowTags, []);

@@ -1,3 +1,4 @@
+import type { CoverageCounts } from './coverage';
 import { parseResultLines, ResultRecord } from './resultProtocol';
 
 /**
@@ -189,6 +190,28 @@ export interface BlockSummary {
 	failed: number;
 	loadFailures: ModuleLoadFailure[];
 	elapsedMs: number;
+	/** Line counts from @rbxts/lunit's coverage transformer; absent unless the build was instrumented. */
+	coverage?: CoverageCounts;
+}
+
+/** Decodes a summary's `coverage` field, dropping anything that is not a positive line with a count. */
+function parseCoverage(value: unknown): CoverageCounts | undefined {
+	const raw = asRecord(value);
+	if (!raw) {
+		return undefined;
+	}
+	const coverage: CoverageCounts = {};
+	for (const [file, lines] of Object.entries(raw)) {
+		const counts: Record<number, number> = {};
+		for (const [line, count] of Object.entries(asRecord(lines) ?? {})) {
+			const number = Number(line);
+			if (Number.isInteger(number) && number > 0 && typeof count === 'number' && count >= 0) {
+				counts[number] = count;
+			}
+		}
+		coverage[file] = counts;
+	}
+	return coverage;
 }
 
 function nonNegativeInteger(value: unknown): number | undefined {
@@ -218,7 +241,12 @@ export function parseBlockSummary(output: string): BlockSummary | undefined {
 		return undefined;
 	}
 	const elapsed = typeof raw.elapsedMs === 'number' && raw.elapsedMs >= 0 ? raw.elapsedMs : 0;
-	return { results, failed, loadFailures: parseLoadFailures(raw.loadFailures), elapsedMs: elapsed };
+	const summary: BlockSummary = { results, failed, loadFailures: parseLoadFailures(raw.loadFailures), elapsedMs: elapsed };
+	const coverage = parseCoverage(raw.coverage);
+	if (coverage) {
+		summary.coverage = coverage;
+	}
+	return summary;
 }
 
 export interface WorkerProcessResult {

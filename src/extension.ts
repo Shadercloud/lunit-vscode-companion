@@ -38,6 +38,7 @@ import {
 import { TestRef } from './luneBlocks';
 import { LiveResults } from './liveResults';
 import { CancelSignal } from './cancelSignal';
+import { coverageByFile, coverageFromReport, NO_COVERAGE_MESSAGE } from './coverage';
 import { writeCliLauncher } from './cliLauncher';
 import {
 	installStudioPlugin,
@@ -275,9 +276,11 @@ export function activate(context: vscode.ExtensionContext): void {
 	// profile from the Run dropdown also marks it default (and the others not)
 	// -- harmless if it already was.
 	const profileListeners = new Map<RunProfileId, vscode.Disposable>();
+	// The coverage profile is a kind of its own, with its own default; it
+	// takes no part in choosing the single default run profile.
 	const makeSoleDefault = (id: RunProfileId) => {
 		for (const [otherId, other] of profileRefs) {
-			if (otherId !== id) {
+			if (otherId !== id && otherId !== 'luneCoverage') {
 				other.isDefault = false;
 			}
 		}
@@ -290,6 +293,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		const specs = runProfileSpecs({
 			studioEnabled: config?.studio.enabled ?? true,
 			slowTags: config?.lune.slowTags ?? [],
+			coverageSupported: hasCoverageApi(),
 		});
 		const wanted = new Set(specs.map((spec) => spec.id));
 		for (const [id, profile] of [...profileRefs]) {
@@ -306,18 +310,25 @@ export function activate(context: vscode.ExtensionContext): void {
 			}
 			const profile = controller.createRunProfile(
 				spec.label,
-				vscode.TestRunProfileKind.Run,
+				spec.coverage ? vscode.TestRunProfileKind.Coverage : vscode.TestRunProfileKind.Run,
 				(request, token) => {
-					profile.isDefault = true;
-					makeSoleDefault(spec.id);
-					return executeRun(controller, request, token, spec.via, { includeSlow: spec.includeSlow }).then(
-						() => undefined,
-					);
+					if (!spec.coverage) {
+						profile.isDefault = true;
+						makeSoleDefault(spec.id);
+					}
+					return executeRun(controller, request, token, spec.via, {
+						includeSlow: spec.includeSlow,
+						coverage: spec.coverage,
+					}).then(() => undefined);
 				},
 				spec.isDefault,
 				spec.via === 'lune' ? LUNE_TAG : STUDIO_TAG,
 			);
 			profileRefs.set(spec.id, profile);
+			if (spec.coverage) {
+				profile.loadDetailedCoverage = async (_run, fileCoverage) => statementCoverage.get(fileCoverage) ?? [];
+				continue;
+			}
 			profileListeners.set(
 				spec.id,
 				profile.onDidChangeDefault((isDefault) => {
@@ -328,7 +339,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			);
 		}
 		// Removing the default profile must not leave none.
-		if (![...profileRefs.values()].some((profile) => profile.isDefault)) {
+		if (![...profileRefs].some(([id, profile]) => id !== 'luneCoverage' && profile.isDefault)) {
 			profileRefs.get('lune')!.isDefault = true;
 		}
 	};
@@ -803,6 +814,46 @@ interface ExecuteRunOptions {
 	explicitTests?: boolean;
 	/** Lune only: overrides `lunit.lune.parallel.workers` for this run (the command line's `--workers`). */
 	workers?: number;
+	/** Lune only: compile with `lunit.coverage.compileCommand` and report line coverage to VS Code. */
+	coverage?: boolean;
+}
+
+/** Whether this VS Code has the test coverage API (stable since 1.88). */
+function hasCoverageApi(): boolean {
+	return typeof vscode.FileCoverage === 'function' && vscode.TestRunProfileKind.Coverage !== undefined;
+}
+
+/** Per-line details for each FileCoverage handed to VS Code, for the profile's loadDetailedCoverage. */
+const statementCoverage = new WeakMap<vscode.FileCoverage, vscode.StatementCoverage[]>();
+
+/**
+ * Hands a Lune run's line counts to VS Code: one FileCoverage per source file,
+ * with a StatementCoverage per line that starts a statement. Paths are
+ * relative to the workspace folder, where the compile command's tsconfig is.
+ * Returns a note for the output, or undefined when all went well.
+ */
+function addCoverage(run: vscode.TestRun, root: vscode.Uri, report: LuneRunReport | undefined): string | undefined {
+	const counts = coverageFromReport(report);
+	if (!counts) {
+		return NO_COVERAGE_MESSAGE;
+	}
+	const missing: string[] = [];
+	for (const file of coverageByFile(counts)) {
+		const uri = vscode.Uri.joinPath(root, ...file.file.split('/'));
+		if (!fs.existsSync(uri.fsPath)) {
+			missing.push(file.file);
+			continue;
+		}
+		const coverage = new vscode.FileCoverage(uri, new vscode.TestCoverageCount(file.covered, file.total));
+		statementCoverage.set(
+			coverage,
+			file.lines.map(({ line, count }) => new vscode.StatementCoverage(count, new vscode.Position(line - 1, 0))),
+		);
+		run.addCoverage(coverage);
+	}
+	return missing.length > 0
+		? `[lunit] Coverage for ${missing.length} file(s) not found under the workspace folder: ${missing.join(', ')}`
+		: undefined;
 }
 
 async function executeRun(
@@ -931,9 +982,14 @@ async function executeRun(
 		// A whole-tree run lets the planner run everything the profile allows;
 		// any narrower request (a selection, or exclusions) names its tests.
 		const selection = request.include || excluded.size > 0 ? identities : undefined;
+		// A coverage run always compiles: a watcher's normal build (lunit.skipCompile)
+		// has no counters in it.
+		const runConfig = options.coverage
+			? { ...config, skipCompile: false, compileCommand: config.coverage.compileCommand }
+			: config;
 		let outcome: LuneRunOutcome;
 		try {
-			outcome = await runViaLune(config, token, chunkSink, {
+			outcome = await runViaLune(runConfig, token, chunkSink, {
 				slow: slowFilter,
 				selection,
 				workers: options.workers,
@@ -955,6 +1011,14 @@ async function executeRun(
 		const results = progress.finish(report, (identity) =>
 			outcome.cancelled ? { status: 'skipped' } : resolveVerdict(identity, records, outcome),
 		);
+		if (options.coverage && !outcome.cancelled) {
+			const note = addCoverage(run, folder.uri, report);
+			if (note) {
+				outputChannel.appendLine(note);
+				run.appendOutput(`${note}\r\n`);
+				onOutput?.(`${note}\n`);
+			}
+		}
 		endRun();
 		const summary = withSlowCount(buildSummary(via, [...results, ...leftOutResults], outcome.cancelled));
 		return report && report.blocks.length > 0 ? { ...summary, lune: summarizeReport(report) } : summary;

@@ -7,7 +7,7 @@ import { RunVia, TestIdentity } from './runReport';
  * definition, and so both can be unit-tested in plain Node.
  */
 
-export type RunProfileId = 'lune' | 'luneFull' | 'studio';
+export type RunProfileId = 'lune' | 'luneFull' | 'luneCoverage' | 'studio';
 
 export interface RunProfileSpec {
 	id: RunProfileId;
@@ -16,28 +16,60 @@ export interface RunProfileSpec {
 	/** Whether slow-tagged tests run even when not selected explicitly. */
 	includeSlow: boolean;
 	isDefault: boolean;
+	/**
+	 * A coverage profile (VS Code's `TestRunProfileKind.Coverage`): compiles
+	 * with `lunit.coverage.compileCommand` and reports line coverage.
+	 */
+	coverage: boolean;
 }
 
 export interface RunProfileSettings {
 	studioEnabled: boolean;
 	slowTags: readonly string[];
+	/** Whether this VS Code has the test coverage API (1.88+). */
+	coverageSupported?: boolean;
 }
 
 /**
  * Which profiles to register: "Run with Lune" always (and by default), "Run
  * with Lune (Full)" only when `lunit.lune.slowTags` names a tag, so projects
- * without slow tests see no change, and "Run in Roblox Studio" unless
- * disabled.
+ * without slow tests see no change, "Run with Lune (Coverage)" when VS Code
+ * has the coverage API, and "Run in Roblox Studio" unless disabled.
  */
 export function runProfileSpecs(settings: RunProfileSettings): RunProfileSpec[] {
 	const specs: RunProfileSpec[] = [
-		{ id: 'lune', label: 'Run with Lune', via: 'lune', includeSlow: false, isDefault: true },
+		{ id: 'lune', label: 'Run with Lune', via: 'lune', includeSlow: false, isDefault: true, coverage: false },
 	];
 	if (settings.slowTags.length > 0) {
-		specs.push({ id: 'luneFull', label: 'Run with Lune (Full)', via: 'lune', includeSlow: true, isDefault: false });
+		specs.push({
+			id: 'luneFull',
+			label: 'Run with Lune (Full)',
+			via: 'lune',
+			includeSlow: true,
+			isDefault: false,
+			coverage: false,
+		});
+	}
+	if (settings.coverageSupported) {
+		// The only coverage profile, so the default of its own kind.
+		specs.push({
+			id: 'luneCoverage',
+			label: 'Run with Lune (Coverage)',
+			via: 'lune',
+			includeSlow: false,
+			isDefault: true,
+			coverage: true,
+		});
 	}
 	if (settings.studioEnabled) {
-		specs.push({ id: 'studio', label: 'Run in Roblox Studio', via: 'studio', includeSlow: false, isDefault: false });
+		specs.push({
+			id: 'studio',
+			label: 'Run in Roblox Studio',
+			via: 'studio',
+			includeSlow: false,
+			isDefault: false,
+			coverage: false,
+		});
 	}
 	return specs;
 }

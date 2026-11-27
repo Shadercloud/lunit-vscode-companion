@@ -9,6 +9,7 @@
 //   FAKE_LUNE_LISTING   JSON file printed verbatim after the module marker
 //   FAKE_LUNE_LOG       directory receiving start-<n>/end-<n> files per block
 //   FAKE_LUNE_DISCOVERY_FAILS  when set, --list prints noise and exits 2
+//   FAKE_LUNE_COVERAGE  JSON object added to every block summary as `coverage`
 //
 // A job's behaviour is scripted by the last segment of each module path:
 //   ok[-*]         run every method in the spec, passing
@@ -105,6 +106,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 		loadFailures,
 		elapsedMs: Date.now() - startedAt,
 	};
+	if (process.env.FAKE_LUNE_COVERAGE) {
+		summary.coverage = JSON.parse(process.env.FAKE_LUNE_COVERAGE);
+	}
 	console.log(`@@LUNIT_BLOCK@@${JSON.stringify(summary)}`);
 	process.exit(failed > 0 || loadFailures.length > 0 ? 1 : 0);
 })();

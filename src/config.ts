@@ -33,6 +33,10 @@ export interface LunitConfig {
 	excludeGlob: string;
 	skipCompile: boolean;
 	compileCommand: string;
+	coverage: {
+		/** Compiles an instrumented build for "Run with Lune (Coverage)" (@rbxts/lunit/transformer). */
+		compileCommand: string;
+	};
 	outDir: string;
 	env: Record<string, string>;
 	lune: {
@@ -173,6 +177,12 @@ export function buildConfig(root: string, storageDir: string, get: SettingReader
 		excludeGlob: get<string>('excludeGlob', '**/node_modules/**'),
 		skipCompile: get<boolean>('skipCompile', false),
 		compileCommand: resolveTokens(get<string>('compileCommand', 'npx rbxtsc'), baseTokens),
+		coverage: {
+			compileCommand: resolveTokens(
+				get<string>('coverage.compileCommand', 'npx rbxtsc -p tsconfig.coverage.json'),
+				baseTokens,
+			),
+		},
 		outDir,
 		env: get<Record<string, string>>('env', {}),
 		lune: {

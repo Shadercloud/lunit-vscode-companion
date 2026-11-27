@@ -344,3 +344,18 @@ test('concurrent runs keep their generated files apart and clean up after themse
 	assert.notEqual(path.dirname(firstJob), path.dirname(secondJob), 'each run has its own directory of generated files');
 	assert.deepEqual(fs.readdirSync(path.join(ws.storage, 'lune-runs')), []);
 });
+
+test('every block reports its coverage, and the report adds the counts up across workers', async (t) => {
+	const { coverageFromReport } = require('../out/coverage');
+	const counts = { 'src/shop.ts': { 3: 1, 8: 0 } };
+	const ws = workspace(
+		t,
+		[mod('ok-a', 'A', [method('t')]), mod('ok-b', 'B', [method('t')]), mod('ok-c', 'C', [method('t')])],
+		{},
+		{ FAKE_LUNE_COVERAGE: JSON.stringify(counts) },
+	);
+	const { outcome, report } = await run(ws);
+	assert.equal(outcome.code, 0);
+	assert.equal(report.blocks.length, 3);
+	assert.deepEqual(coverageFromReport(report), { 'src/shop.ts': { 3: 3, 8: 0 } });
+});

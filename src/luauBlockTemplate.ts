@@ -164,13 +164,41 @@ local function lunitRunJob(job, loadModule, lunit)
 	return failed, loadFailures, (os.clock() - started) * 1000
 end
 
-local function lunitEmitBlockSummary(block, failed, loadFailures, elapsedMs)
+-- Line counts recorded by @rbxts/lunit's coverage transformer, when this
+-- process loaded an instrumented build: { [file] = { ["<line>"] = count } }.
+-- Line numbers become string keys so the JSON is an object, not a sparse array.
+-- globals is the _G the test modules see: the runner's own for a package
+-- project, the DataModel's shared one for a game project.
+local function lunitCoverageCounts(globals)
+	local store = rawget(globals or _G, "__lunitCoverage")
+	if type(store) ~= "table" then
+		return nil
+	end
+	local out = {}
+	local any = false
+	for file, counts in store do
+		if type(file) == "string" and type(counts) == "table" then
+			local lines = {}
+			for line, count in counts do
+				if type(line) == "number" and type(count) == "number" then
+					lines[tostring(line)] = count
+				end
+			end
+			out[file] = lines
+			any = true
+		end
+	end
+	return if any then out else nil
+end
+
+local function lunitEmitBlockSummary(block, failed, loadFailures, elapsedMs, globals)
 	print(LUNIT_BLOCK_MARKER .. lunitSerde.encode("json", {
 		block = tostring(block),
 		results = #LUNIT_OUTPUT_BUFFER,
 		failed = failed,
 		loadFailures = loadFailures,
 		elapsedMs = math.floor(elapsedMs + 0.5),
+		coverage = lunitCoverageCounts(globals),
 	}))
 end`;
 }
