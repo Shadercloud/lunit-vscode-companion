@@ -107,6 +107,11 @@
           "default": "npx rbxtsc",
           "description": "Command used to compile the roblox-ts project to Luau before running tests. Run from the workspace folder root."
         },
+        "lunit.coverage.compileCommand": {
+          "type": "string",
+          "default": "npx rbxtsc -p tsconfig.coverage.json",
+          "description": "Command used to compile the project for \"Run with Lune (Coverage)\". It must build with the @rbxts/lunit/transformer plugin (Lunit 4.3+). Run from the workspace folder root."
+        },
         "lunit.outDir": {
           "type": "string",
           "default": "out",
